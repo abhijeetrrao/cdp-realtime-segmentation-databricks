@@ -1,0 +1,32 @@
+bundle:
+  name: cdp_realtime_segmentation
+
+variables:
+  catalog:
+    default: main
+  schema:
+    default: cdp_rt_sim
+  volume:
+    default: cdp_rt_volume
+  lakebase_endpoint:
+    default: projects/REPLACE_ME/branches/production/endpoints/primary
+  lakebase_database:
+    default: databricks_postgres
+  eventhub_bootstrap:
+    default: REPLACE_ME.servicebus.windows.net:9093
+  eventhub_name:
+    default: tealium-events
+  eventhub_secret_scope:
+    default: cdp-rt
+  eventhub_secret_key:
+    default: eventhub-connection-string
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://REPLACE_ME.azuredatabricks.net

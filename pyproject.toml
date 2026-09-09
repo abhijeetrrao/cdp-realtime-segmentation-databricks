@@ -1,0 +1,18 @@
+[project]
+name = "cdp-realtime-segmentation-databricks"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "databricks-sdk>=0.40.0",
+  "psycopg2-binary>=2.9.9"
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

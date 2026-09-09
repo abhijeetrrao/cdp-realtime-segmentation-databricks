@@ -1,0 +1,308 @@
+resources:
+  jobs:
+    cdp_sdp_lakebase_sizing:
+      name: "[${bundle.target}] CDP SDP + Lakebase sizing run"
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: volume
+          default: ${var.volume}
+        - name: profile_count
+          default: "1000000"
+        - name: account_count
+          default: "1000000"
+        - name: lakebase_endpoint
+          default: ${var.lakebase_endpoint}
+        - name: lakebase_database
+          default: ${var.lakebase_database}
+        - name: eventhub_bootstrap
+          default: ${var.eventhub_bootstrap}
+        - name: eventhub_name
+          default: ${var.eventhub_name}
+        - name: eventhub_secret_scope
+          default: ${var.eventhub_secret_scope}
+        - name: eventhub_secret_key
+          default: ${var.eventhub_secret_key}
+        - name: event_scale_fraction
+          default: "0.02"
+        - name: burst_multiplier
+          default: "1.0"
+        - name: trigger_interval
+          default: "sdp-continuous"
+        - name: sizing_duration_seconds
+          default: "1800"
+        - name: read_qps
+          default: "0"
+        - name: read_concurrency
+          default: "8"
+        - name: sizing_run_id
+          default: "sdp_30m"
+      performance_target: PERFORMANCE_OPTIMIZED
+      environments:
+        - environment_key: cdp_serverless
+          spec:
+            client: "4"
+            dependencies:
+              - --editable ${workspace.file_path}
+              - azure-eventhub>=5.12.0
+              - databricks-sdk>=0.40.0
+      tasks:
+        - task_key: reset_realtime_run
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_reset_realtime_run.py
+            source: WORKSPACE
+            base_parameters:
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"
+              checkpoint_suffix: "sdp_pipeline_external_checkpoint_unused"
+        - task_key: start_realtime_pipeline
+          depends_on:
+            - task_key: reset_realtime_run
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_start_realtime_pipeline.py
+            source: WORKSPACE
+            base_parameters:
+              pipeline_id: ${resources.pipelines.cdp_realtime_segmentation_pipeline.id}
+              force_continuous: "true"
+              full_refresh: "true"
+              event_run_id: "{{job.parameters.sizing_run_id}}"
+        - task_key: eventhub_generator
+          depends_on:
+            - task_key: start_realtime_pipeline
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/03_eventhub_generator.py
+            source: WORKSPACE
+            base_parameters:
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"
+              generator_duration_seconds: "{{job.parameters.sizing_duration_seconds}}"
+              generator_initial_sleep_seconds: "45"
+        - task_key: lakebase_read_load
+          depends_on:
+            - task_key: start_realtime_pipeline
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_lakebase_read_load.py
+            source: WORKSPACE
+            base_parameters:
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"
+              read_duration_seconds: "{{job.parameters.sizing_duration_seconds}}"
+              read_qps: "{{job.parameters.read_qps}}"
+              read_concurrency: "{{job.parameters.read_concurrency}}"
+        - task_key: stop_realtime_pipeline
+          depends_on:
+            - task_key: eventhub_generator
+            - task_key: lakebase_read_load
+          run_if: ALL_DONE
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_stop_realtime_pipeline.py
+            source: WORKSPACE
+            base_parameters:
+              pipeline_id: ${resources.pipelines.cdp_realtime_segmentation_pipeline.id}
+              stop_delay_seconds: "120"
+        - task_key: wait_for_rt_metrics
+          depends_on:
+            - task_key: stop_realtime_pipeline
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_wait_for_rt_metrics.py
+            source: WORKSPACE
+            base_parameters:
+              min_non_empty_rt_batches: "3"
+        - task_key: read_profile_segments
+          depends_on:
+            - task_key: wait_for_rt_metrics
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/06_read_profile_segments.py
+            source: WORKSPACE
+        - task_key: sizing_report
+          depends_on:
+            - task_key: wait_for_rt_metrics
+            - task_key: lakebase_read_load
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/07_sizing_report.py
+            source: WORKSPACE
+            base_parameters:
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"
+
+    cdp_realtime_segmentation_setup:
+      name: "[${bundle.target}] CDP segmentation setup and sync"
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: volume
+          default: ${var.volume}
+        - name: profile_count
+          default: "1000000"
+        - name: account_count
+          default: "1000000"
+        - name: profile_sync_limit
+          default: "100000"
+        - name: lakebase_endpoint
+          default: ${var.lakebase_endpoint}
+        - name: lakebase_database
+          default: ${var.lakebase_database}
+        - name: eventhub_bootstrap
+          default: ${var.eventhub_bootstrap}
+        - name: eventhub_name
+          default: ${var.eventhub_name}
+        - name: eventhub_secret_scope
+          default: ${var.eventhub_secret_scope}
+        - name: eventhub_secret_key
+          default: ${var.eventhub_secret_key}
+        - name: event_scale_fraction
+          default: "0.05"
+        - name: burst_multiplier
+          default: "1.0"
+        - name: trigger_interval
+          default: "5 seconds"
+        - name: sizing_run_id
+          default: "smoke_1m"
+      performance_target: PERFORMANCE_OPTIMIZED
+      environments:
+        - environment_key: cdp_serverless
+          spec:
+            client: "4"
+            dependencies:
+              - --editable ${workspace.file_path}
+              - azure-eventhub>=5.12.0
+              - databricks-sdk>=0.40.0
+      tasks:
+        - task_key: generate_delta
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/01_generate_delta.py
+            source: WORKSPACE
+        - task_key: lakebase_init_and_sync
+          depends_on:
+            - task_key: generate_delta
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/02_lakebase_init_and_sync.py
+            source: WORKSPACE
+            base_parameters:
+              profile_sync_limit: "{{job.parameters.profile_sync_limit}}"
+        - task_key: batch_segments
+          depends_on:
+            - task_key: lakebase_init_and_sync
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/05_batch_segments.py
+            source: WORKSPACE
+
+    cdp_realtime_segmentation:
+      name: "[${bundle.target}] CDP realtime segmentation performance run"
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: volume
+          default: ${var.volume}
+        - name: profile_count
+          default: "1000000"
+        - name: account_count
+          default: "1000000"
+        - name: lakebase_endpoint
+          default: ${var.lakebase_endpoint}
+        - name: lakebase_database
+          default: ${var.lakebase_database}
+        - name: eventhub_bootstrap
+          default: ${var.eventhub_bootstrap}
+        - name: eventhub_name
+          default: ${var.eventhub_name}
+        - name: eventhub_secret_scope
+          default: ${var.eventhub_secret_scope}
+        - name: eventhub_secret_key
+          default: ${var.eventhub_secret_key}
+        - name: event_scale_fraction
+          default: "0.05"
+        - name: burst_multiplier
+          default: "1.0"
+        - name: trigger_interval
+          default: "5 seconds"
+        - name: sizing_run_id
+          default: "smoke_1m"
+        - name: starting_timestamp_ms
+          default: ""
+      performance_target: PERFORMANCE_OPTIMIZED
+      environments:
+        - environment_key: cdp_serverless
+          spec:
+            client: "4"
+            dependencies:
+              - --editable ${workspace.file_path}
+              - azure-eventhub>=5.12.0
+              - databricks-sdk>=0.40.0
+      tasks:
+        - task_key: reset_realtime_run
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_reset_realtime_run.py
+            source: WORKSPACE
+            base_parameters:
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"
+              checkpoint_suffix: "realtime_segmentation_serverless_job"
+        - task_key: eventhub_generator
+          depends_on:
+            - task_key: reset_realtime_run
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/03_eventhub_generator.py
+            source: WORKSPACE
+            base_parameters:
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"
+              generator_duration_seconds: "600"
+              generator_initial_sleep_seconds: "0"
+              generator_send_batch_size: "1000"
+              generator_throttle_backoff_seconds: "4"
+        - task_key: realtime_segmentation_stream
+          depends_on:
+            - task_key: eventhub_generator
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_realtime_segmentation_stream.py
+            source: WORKSPACE
+            base_parameters:
+              stream_trigger_mode: "availableNow"
+              starting_offsets: "latest"
+              starting_timestamp_ms: "{{job.parameters.starting_timestamp_ms}}"
+              max_offsets_per_trigger: "500"
+              membership_write_mode: "direct_psycopg"
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"
+              event_run_id: "{{job.parameters.sizing_run_id}}"
+              checkpoint_suffix: "realtime_segmentation_serverless_job"
+        - task_key: read_profile_segments
+          depends_on:
+            - task_key: wait_for_rt_metrics
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/06_read_profile_segments.py
+            source: WORKSPACE
+        - task_key: wait_for_rt_metrics
+          depends_on:
+            - task_key: realtime_segmentation_stream
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/04_wait_for_rt_metrics.py
+            source: WORKSPACE
+        - task_key: sizing_report
+          depends_on:
+            - task_key: wait_for_rt_metrics
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/07_sizing_report.py
+            source: WORKSPACE
+            base_parameters:
+              sizing_run_id: "{{job.parameters.sizing_run_id}}"

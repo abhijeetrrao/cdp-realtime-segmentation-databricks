@@ -1,0 +1,29 @@
+resources:
+  pipelines:
+    cdp_realtime_segmentation_pipeline:
+      name: "[${bundle.target}] CDP realtime segmentation SDP"
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      continuous: true
+      channel: PREVIEW
+      development: true
+      libraries:
+        - glob:
+            include: ../src/pipelines/realtime/**
+      environment:
+        dependencies:
+          - --editable ${workspace.file_path}
+          - databricks-sdk>=0.40.0
+      configuration:
+        spark.sql.shuffle.partitions: "auto"
+        bundle_file_path: ${workspace.file_path}
+        lakebase_endpoint: ${var.lakebase_endpoint}
+        lakebase_database: ${var.lakebase_database}
+        eventhub_bootstrap: ${var.eventhub_bootstrap}
+        eventhub_name: ${var.eventhub_name}
+        eventhub_secret_scope: ${var.eventhub_secret_scope}
+        eventhub_secret_key: ${var.eventhub_secret_key}
+        cdp_schema: "cdp_rt"
+        pipelines.numUpdateRetryAttempts: "0"
+        pipelines.maxFlowRetryAttempts: "0"
