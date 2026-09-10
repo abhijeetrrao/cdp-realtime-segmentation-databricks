@@ -34,6 +34,8 @@ variables:
     default: profile_attributes_delta
   profile_id_col:
     default: profile_id
+  profile_accounts_col:
+    default: accounts
   account_table_name:
     default: account_attributes_delta
   account_profile_id_col:

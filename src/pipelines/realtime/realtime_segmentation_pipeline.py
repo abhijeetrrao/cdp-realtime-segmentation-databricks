@@ -34,6 +34,7 @@ SOURCE_EVENT_TS_COL = spark.conf.get("source_event_ts_col", "event_ts")
 SOURCE_CHANGED_PROPERTIES_COL = spark.conf.get("source_changed_properties_col", "changed_properties")
 PROFILE_TABLE_NAME = spark.conf.get("profile_table_name", "profile_attributes_delta")
 PROFILE_ID_COL = spark.conf.get("profile_id_col", "profile_id")
+PROFILE_ACCOUNTS_COL = spark.conf.get("profile_accounts_col", "accounts")
 ACCOUNT_TABLE_NAME = spark.conf.get("account_table_name", "account_attributes_delta")
 ACCOUNT_PROFILE_ID_COL = spark.conf.get("account_profile_id_col", "profile_id")
 ACCOUNT_ID_COL = spark.conf.get("account_id_col", "account_id")
@@ -565,7 +566,21 @@ def _account_property_modes(rules: list[dict]) -> tuple[set[str], set[str]]:
     return numeric_props, array_props - numeric_props
 
 
-def _aggregate_accounts(rules: list[dict]):
+def _profile_account_bridge(profiles):
+    profile_cols = set(profiles.columns)
+    if PROFILE_ACCOUNTS_COL not in profile_cols:
+        return None
+    return (
+        profiles.select(
+            F.col("profile_id"),
+            F.explode(F.split(F.col(f"`{PROFILE_ACCOUNTS_COL}`").cast("string"), ";")).alias("_account_id"),
+        )
+        .select("profile_id", F.trim(F.col("_account_id")).alias("account_id"))
+        .where("account_id IS NOT NULL AND account_id <> ''")
+    )
+
+
+def _aggregate_accounts(rules: list[dict], profiles):
     accounts = spark.read.table(ACCOUNT_TABLE_NAME)
     account_cols = set(accounts.columns)
     numeric_props, array_props = _account_property_modes(rules)
@@ -580,6 +595,19 @@ def _aggregate_accounts(rules: list[dict]):
         return None
     if ACCOUNT_PROFILE_ID_COL in account_cols:
         return accounts.groupBy(F.col(f"`{ACCOUNT_PROFILE_ID_COL}`").cast("string").alias("profile_id")).agg(*aggregations)
+    if ACCOUNT_ID_COL in account_cols:
+        bridge = _profile_account_bridge(profiles)
+        if bridge is not None:
+            account_props = sorted((numeric_props | array_props) & account_cols)
+            joined = bridge.alias("b").join(
+                accounts.alias("acct"),
+                F.col("b.account_id") == F.col(f"acct.`{ACCOUNT_ID_COL}`").cast("string"),
+                "inner",
+            ).select(
+                F.col("b.profile_id"),
+                *[F.col(f"acct.`{prop}`").alias(prop) for prop in account_props],
+            )
+            return joined.groupBy("profile_id").agg(*aggregations)
     if ACCOUNT_ID_COL in account_cols:
         return accounts.groupBy(F.col(f"`{ACCOUNT_ID_COL}`").cast("string").alias("account_id")).agg(*aggregations)
     raise ValueError(
@@ -628,12 +656,12 @@ def evaluated_realtime_memberships():
     rules = _load_realtime_rules()
     segment_triggers = F.broadcast(_segment_trigger_dataframe(rules)).alias("st")
     events = spark.readStream.table(SDP_EVENT_TABLE_NAME).alias("e")
-    profiles = (
+    profiles_base = (
         spark.read.table(PROFILE_TABLE_NAME)
         .withColumn("profile_id", F.col(f"`{PROFILE_ID_COL}`").cast("string"))
-        .alias("p")
     )
-    account_agg = _aggregate_accounts(rules)
+    profiles = profiles_base.alias("p")
+    account_agg = _aggregate_accounts(rules, profiles_base)
     account_array_props = _account_property_modes(rules)[1]
 
     joined = events.join(

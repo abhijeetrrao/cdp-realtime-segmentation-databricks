@@ -31,6 +31,7 @@ resources:
         source_changed_properties_col: ${var.source_changed_properties_col}
         profile_table_name: ${var.profile_table_name}
         profile_id_col: ${var.profile_id_col}
+        profile_accounts_col: ${var.profile_accounts_col}
         account_table_name: ${var.account_table_name}
         account_profile_id_col: ${var.account_profile_id_col}
         account_id_col: ${var.account_id_col}

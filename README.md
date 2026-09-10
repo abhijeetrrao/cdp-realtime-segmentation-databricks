@@ -18,7 +18,7 @@ The current optimized path is the SDP pipeline in `src/pipelines/realtime/realti
 4. Realtime segment definitions are read from Delta.
 5. The row's `changed_properties` are used as a reverse-index trigger to identify candidate segments.
 6. Candidate segment rows are joined with profile attributes from Delta.
-7. Account-sourced rule properties are aggregated to profile level before evaluation. Numeric comparison fields are summed across the profile's accounts; string/date-style account fields are collected so `contains`/date predicates can match any account value.
+7. Account-sourced rule properties are aggregated to profile level before evaluation. The customer profile table's `accounts` column is treated as a semicolon-delimited list of account IDs. Numeric comparison fields are summed across those accounts; string/date-style account fields are collected so `contains`/date predicates can match any account value.
 8. Spark evaluates the stateless nested boolean rule:
 
    ```text
@@ -225,6 +225,7 @@ Configure these bundle variables before deployment:
 | `source_event_table_name` | `cdp_prd.aap_processed_data.<listener_attribute_changes_table>` |
 | `profile_table_name` | `cdp_prd.aap_processed_data.segments_aap_profiles` |
 | `profile_id_col` | `profile_id` |
+| `profile_accounts_col` | `accounts` |
 | `account_table_name` | `cdp_prd.aap_processed_data.segments_aap_accounts` |
 | `account_profile_id_col` | `profile_id` |
 | `segment_definitions_table_name` | `<catalog>.<schema>.segment_definitions_delta` or `segment_definitions_delta` |
@@ -367,7 +368,7 @@ Property source handling:
 
 | Rule property | Source behavior |
 | --- | --- |
-| `source: "ACCOUNTS"` or `AZ_A_*` | Read from the account table and aggregate to profile level. Numeric comparison fields are summed across all accounts for the profile. Non-numeric account fields are collected so predicates can match any account value. |
+| `source: "ACCOUNTS"` or `AZ_A_*` | Read from the account table and aggregate to profile level. If the account table has no profile key, the pipeline splits the profile table's semicolon-delimited `accounts` column and joins those account IDs to the account table. Numeric comparison fields are summed across all accounts for the profile. Non-numeric account fields are collected so predicates can match any account value. |
 | Column present in the listener/source table | Read from the streaming source row. |
 | Other properties | Read from the profile table. Customer `AZ_C_*` fields are expected to come from `cdp_prd.aap_processed_data.segments_aap_profiles`. |
 
@@ -378,7 +379,7 @@ profile_table_name = cdp_prd.aap_processed_data.segments_aap_profiles
 account_table_name = cdp_prd.aap_processed_data.segments_aap_accounts
 ```
 
-If `segments_aap_accounts` does not have one row per `(profile_id, account)` or does not contain `profile_id`, set `account_profile_id_col` or provide a profile-account mapping before running SDP. The account aggregation requires a key that maps account rows back to the profile being evaluated.
+For the customer profile table, set `profile_accounts_col = accounts`. If `segments_aap_accounts` has a direct profile key, set `account_profile_id_col`; otherwise the pipeline joins `segments_aap_profiles.accounts` to `segments_aap_accounts.account_id` and aggregates account metrics across the matched accounts.
 
 ## Sizing Notes From the Stress Test
 
