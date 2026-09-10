@@ -14,24 +14,23 @@ The current optimized path is the SDP pipeline in `src/pipelines/realtime/realti
 
 1. Attribute-change events are read from a physical Delta table with `spark.readStream.table(...)`.
 2. The source table is expected to contain `profile_id`, event time, event ID, `changed_properties`, and the listener/behavioral attributes being updated.
-3. Rows with no realtime-relevant changed properties are filtered out.
-4. Realtime segment definitions are read from Delta.
-5. The row's `changed_properties` are used as a reverse-index trigger to identify candidate segments.
-6. Candidate segment rows are joined with profile attributes from Delta.
-7. Account-sourced rule properties are aggregated to profile level before evaluation. The customer profile table's `accounts` column is treated as a semicolon-delimited list of account IDs. Numeric comparison fields are summed across those accounts; string/date-style account fields are collected so `contains`/date predicates can match any account value.
-8. Spark evaluates the stateless nested boolean rule:
+3. Realtime segment definitions and attribute mappings are read from Delta at the start of each qualification microbatch.
+4. The row's `changed_properties` are used as a reverse-index trigger to identify candidate segments for that microbatch.
+5. Candidate segment rows are joined with profile attributes from Delta.
+6. Account-sourced rule properties are aggregated to profile level before evaluation. The customer profile table's `accounts` column is treated as a semicolon-delimited list of account IDs. Numeric comparison fields are summed across those accounts; string/date-style account fields are collected so `contains`/date predicates can match any account value.
+7. Spark evaluates the stateless nested boolean rule:
 
    ```text
    listener/behavioral conditions AND profile conditions AND aggregated account conditions
    ```
 
-9. Auto CDC / SCD Type 1 maintains the latest current membership per:
+8. A per-microbatch Delta merge maintains the latest current membership per:
 
    ```text
    profile_id, segment_id, path
    ```
 
-10. The current membership table is synced to Lakebase/Postgres for keyed serving reads.
+9. The current membership table is synced to Lakebase/Postgres for keyed serving reads.
 
 The qualification computation is stateless. The pipeline does not keep session windows or cross-event state. The only stateful piece is the current-state table that stores the latest membership flag for each profile/segment/path key.
 
@@ -47,9 +46,9 @@ Delta/Unity Catalog tables:
 | `segment_attribute_mapping` | Maps customer rule attribute names to physical Databricks columns and source tables. |
 | `segment_reverse_index_delta` | Precomputed `property_name -> segment_ids` fanout table for realtime rules. Useful for observability and for implementations that explicitly join through a reverse index. |
 | customer listener table | Physical Delta table produced by the Tealium listener process. Configure through `source_event_table_name`. This replaces direct Event Hub reads for the customer flow. |
-| `tealium_eventhub_events_<run_id>` | SDP streaming table containing parsed and filtered Event Hub events for a sizing run. |
-| `evaluated_realtime_memberships_<run_id>` | SDP table with one evaluated row per event/profile/candidate segment. |
-| `membership_flags_current_<run_id>` | Auto CDC current-state table. This is the table intended to sync into Lakebase. |
+| `tealium_eventhub_events_<run_id>` | SDP streaming table containing normalized source listener rows for a sizing run. |
+| `evaluated_realtime_memberships_<run_id>` | Delta table with one evaluated row per event/profile/candidate segment, written by the per-microbatch qualification sink. |
+| `membership_flags_current_<run_id>` | Delta current-state table maintained by a per-microbatch merge. This is the table intended to sync into Lakebase. |
 
 Lakebase/Postgres tables:
 
@@ -84,12 +83,12 @@ In production, keep this as a first-class Delta table. It answers:
 When property X changes, which segment IDs might need re-evaluation?
 ```
 
-The current SDP path implements the same idea inline by extracting each realtime rule's event property and joining:
+The current SDP path implements the same idea inside the qualification microbatch by reading the latest realtime rules, extracting each rule's event properties, and joining:
 
 ```python
 events.join(
-    F.broadcast(segments),
-    F.array_contains(F.col("e.changed_properties"), F.col("s.event_property")),
+    F.broadcast(segment_triggers),
+    F.arrays_overlap(F.col("e.changed_properties"), F.col("st.trigger_properties")),
 )
 ```
 
@@ -196,18 +195,17 @@ For compatibility, mapping `source` values of `EVENT`, `PROFILE`, `ACCOUNT`, and
 
 | File | What it does |
 | --- | --- |
-| `src/pipelines/realtime/realtime_segmentation_pipeline.py` | Current realtime segmentation pipeline. Streams from the configured Delta listener table, filters actionable rows, evaluates nested customer segment rules in Spark, and uses Auto CDC SCD Type 1 to maintain current membership. This is the main customer-demo path. |
+| `src/pipelines/realtime/realtime_segmentation_pipeline.py` | Current realtime segmentation pipeline. Streams from the configured Delta listener table, reads current rules/mappings per microbatch, evaluates nested customer segment rules in Spark, and merges current membership state to Delta. This is the main customer-demo path. |
 
 Key functions/tables in the SDP pipeline:
 
 | Object | Purpose |
 | --- | --- |
-| rule trigger properties | Non-account properties extracted from realtime segment rules. These are matched against `changed_properties` to decide which segments to evaluate. |
+| rule trigger properties | Non-account properties extracted from the latest realtime segment rules in each microbatch. These are matched against `changed_properties` to decide which segments to evaluate. |
 | `EVENT_SCHEMA` | Schema used to parse Event Hub messages. |
-| `tealium_eventhub_events()` | Streaming table reading the configured Delta listener table, normalizing the event contract, filtering invalid rows, filtering rows whose `changed_properties` have no realtime rule overlap, and optionally filtering to a `run_id`. Event Hub remains only as a synthetic fallback when `source_event_table_name` is empty. |
-| `evaluated_realtime_memberships()` | Joins filtered rows to candidate realtime segment rules, profile attributes, and aggregated account attributes, evaluates the nested rule, and emits one row per evaluated candidate membership. |
-| `membership_flags_current_<run_id>` | Auto CDC target table holding the current latest membership state. |
-| `dp.create_auto_cdc_flow(...)` | Maintains SCD Type 1 current membership keyed by `profile_id`, `segment_id`, and `path`. |
+| `tealium_eventhub_events()` | Streaming table reading the configured Delta listener table, normalizing the event contract, filtering invalid rows, and optionally filtering to a `run_id`. Event Hub remains only as a synthetic fallback when `source_event_table_name` is empty. |
+| `qualify_realtime_memberships(...)` | `foreachBatch` sink that reads the latest rules and mapping table for the microbatch, fans events out to candidate segments, joins profile/account attributes, evaluates the nested rules, appends evaluated memberships, and merges the current membership table. |
+| `membership_flags_current_<run_id>` | Delta table holding the current latest membership state, keyed by `profile_id`, `segment_id`, and `path`. |
 
 ### Setup and Data Generation Notebooks
 
@@ -505,7 +503,7 @@ Read-load failures:
 
 High latency:
 
-- Check SDP update metrics for Event Hub read lag, evaluation lag, and Auto CDC current-state lag.
+- Check SDP update metrics for source-table read lag, qualification sink latency, and current-table merge latency.
 - Check Lakebase sync lag separately from SDP evaluation latency.
 - Inspect fanout from `segment_reverse_index_delta`; high fanout directly increases evaluated rows.
 

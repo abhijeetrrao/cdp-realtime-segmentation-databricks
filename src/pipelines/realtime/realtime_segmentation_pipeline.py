@@ -45,6 +45,7 @@ SDP_MEMBERSHIP_TABLE_NAME = spark.conf.get("sdp_membership_table_name", "evaluat
 SDP_MEMBERSHIP_CURRENT_TABLE_NAME = spark.conf.get("sdp_membership_current_table_name", "membership_flags_current")
 SDP_FLOW_NAME = spark.conf.get("sdp_flow_name", "qualify_tealium_events")
 APP_ID = "cdp_realtime_segmentation_sdp"
+ALL_TRIGGER_PROPERTIES_SENTINEL = "__ALL_TRIGGER_PROPERTIES__"
 REALTIME_EVENT_PROPERTIES = [
     "beh_page_type",
     "beh_intent",
@@ -340,9 +341,10 @@ def _rule_from_row(row) -> dict:
     return json.loads(value) if isinstance(value, str) else value
 
 
-def _load_realtime_rules() -> list[dict]:
+def _load_realtime_rules(spark_session=None) -> list[dict]:
+    spark_session = spark_session or spark
     rows = (
-        spark.read.table(SEGMENT_DEFINITIONS_TABLE_NAME)
+        spark_session.read.table(SEGMENT_DEFINITIONS_TABLE_NAME)
         .where(F.col("mode") == F.lit("realtime"))
         .select("segment_id", "segment_name", "rule_json")
         .collect()
@@ -357,12 +359,13 @@ def _load_realtime_rules() -> list[dict]:
     ]
 
 
-def _load_attribute_mapping() -> dict[str, dict[str, str]]:
+def _load_attribute_mapping(spark_session=None) -> dict[str, dict[str, str]]:
     if not ATTRIBUTE_MAPPING_TABLE_NAME:
         return {}
+    spark_session = spark_session or spark
     try:
         rows = (
-            spark.read.table(ATTRIBUTE_MAPPING_TABLE_NAME)
+            spark_session.read.table(ATTRIBUTE_MAPPING_TABLE_NAME)
             .select("rule_property", "source", "column_name")
             .where("rule_property IS NOT NULL AND source IS NOT NULL AND column_name IS NOT NULL")
             .collect()
@@ -414,7 +417,7 @@ def _rule_trigger_properties(rules: list[dict], attribute_mapping: dict[str, dic
     return sorted(props)
 
 
-def _segment_trigger_dataframe(rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
+def _segment_trigger_dataframe(spark_session, rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
     rows = []
     for segment in rules:
         triggers = set()
@@ -424,7 +427,7 @@ def _segment_trigger_dataframe(rules: list[dict], attribute_mapping: dict[str, d
                 triggers.add(_leaf_column_name(leaf, attribute_mapping))
         if triggers:
             rows.append((segment["segment_id"], sorted(triggers)))
-    return spark.createDataFrame(rows, "segment_id string, trigger_properties array<string>")
+    return spark_session.createDataFrame(rows, "segment_id string, trigger_properties array<string>")
 
 
 def _as_millis(column: F.Column, data_type: T.DataType) -> F.Column:
@@ -480,7 +483,7 @@ def _ensure_event_contract(events, trigger_props: list[str]):
             _array_from_changed_properties(F.col(f"`{SOURCE_CHANGED_PROPERTIES_COL}`"), isinstance(field.dataType, T.ArrayType)),
         )
     else:
-        out = out.withColumn("changed_properties", F.array(*[F.lit(prop) for prop in (trigger_props or ["__NO_TRIGGER__"])]))
+        out = out.withColumn("changed_properties", F.array(F.lit(ALL_TRIGGER_PROPERTIES_SENTINEL)))
 
     if "run_id" not in out.columns:
         out = out.withColumn("run_id", F.lit(EVENT_RUN_ID or "source_table"))
@@ -714,8 +717,8 @@ def _effective_account_id_col(account_cols: set[str]) -> str | None:
     return None
 
 
-def _aggregate_accounts(rules: list[dict], profiles, attribute_mapping: dict[str, dict[str, str]]):
-    accounts = spark.read.table(ACCOUNT_TABLE_NAME)
+def _aggregate_accounts(spark_session, rules: list[dict], profiles, attribute_mapping: dict[str, dict[str, str]]):
+    accounts = spark_session.read.table(ACCOUNT_TABLE_NAME)
     account_cols = set(accounts.columns)
     account_id_col = _effective_account_id_col(account_cols)
     numeric_props, array_props = _account_property_modes(rules, attribute_mapping)
@@ -778,49 +781,74 @@ def _compiled_membership_expr(
 
 @dp.table(
     name=SDP_EVENT_TABLE_NAME,
-    comment="Parsed source-table events for the active SDP sizing run after realtime property filtering.",
+    comment="Normalized source-table events for the active SDP sizing run.",
     cluster_by=["run_id", "profile_id"],
 )
 def tealium_eventhub_events():
-    rules = _load_realtime_rules()
-    attribute_mapping = _load_attribute_mapping()
-    trigger_props = _rule_trigger_properties(rules, attribute_mapping)
     events = (
-        _read_source_events(trigger_props)
+        _read_source_events([])
         .where("event_id IS NOT NULL AND profile_id IS NOT NULL")
-        .where(
-            F.arrays_overlap(
-                F.col("changed_properties"),
-                F.array(*[F.lit(prop) for prop in (trigger_props or ["__NO_TRIGGER__"])]),
-            )
-        )
     )
     if EVENT_RUN_ID:
         events = events.where(F.col("run_id") == F.lit(EVENT_RUN_ID))
     return events
 
 
-@dp.table(
-    name=SDP_MEMBERSHIP_TABLE_NAME,
-    comment="Spark-evaluated candidate realtime segment memberships for the active SDP sizing run.",
-    cluster_by=["profile_id", "segment_id"],
-)
-def evaluated_realtime_memberships():
-    rules = _load_realtime_rules()
-    attribute_mapping = _load_attribute_mapping()
-    segment_triggers = F.broadcast(_segment_trigger_dataframe(rules, attribute_mapping)).alias("st")
-    events = spark.readStream.table(SDP_EVENT_TABLE_NAME).alias("e")
+def _ensure_membership_delta_tables(spark_session) -> None:
+    spark_session.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {SDP_MEMBERSHIP_TABLE_NAME} (
+          event_id STRING,
+          run_id STRING,
+          profile_id STRING,
+          segment_id STRING,
+          path STRING,
+          event_ts LONG,
+          qualified_at TIMESTAMP,
+          source_event_id STRING,
+          processed_at TIMESTAMP,
+          is_member BOOLEAN
+        )
+        USING DELTA
+        TBLPROPERTIES (delta.enableChangeDataFeed = true)
+        """
+    )
+    spark_session.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {SDP_MEMBERSHIP_CURRENT_TABLE_NAME} (
+          event_id STRING,
+          run_id STRING,
+          profile_id STRING,
+          segment_id STRING,
+          path STRING,
+          event_ts LONG,
+          qualified_at TIMESTAMP,
+          source_event_id STRING,
+          processed_at TIMESTAMP,
+          is_member BOOLEAN
+        )
+        USING DELTA
+        TBLPROPERTIES (delta.enableChangeDataFeed = true)
+        """
+    )
+
+
+def _evaluate_membership_batch(events, rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
+    spark_session = events.sparkSession
+    segment_triggers = F.broadcast(_segment_trigger_dataframe(spark_session, rules, attribute_mapping)).alias("st")
+    events = events.alias("e")
     profiles_base = (
-        spark.read.table(PROFILE_TABLE_NAME)
+        spark_session.read.table(PROFILE_TABLE_NAME)
         .withColumn("profile_id", F.col(f"`{PROFILE_ID_COL}`").cast("string"))
     )
     profiles = profiles_base.alias("p")
-    account_agg = _aggregate_accounts(rules, profiles_base, attribute_mapping)
+    account_agg = _aggregate_accounts(spark_session, rules, profiles_base, attribute_mapping)
     account_array_props = _account_property_modes(rules, attribute_mapping)[1]
 
     joined = events.join(
         segment_triggers,
-        F.arrays_overlap(F.col("e.changed_properties"), F.col("st.trigger_properties")),
+        F.array_contains(F.col("e.changed_properties"), ALL_TRIGGER_PROPERTIES_SENTINEL)
+        | F.arrays_overlap(F.col("e.changed_properties"), F.col("st.trigger_properties")),
     ).select("e.*", F.col("st.segment_id"))
 
     joined = joined.alias("e").join(profiles, F.col("e.profile_id") == F.col("p.profile_id"))
@@ -850,30 +878,61 @@ def evaluated_realtime_memberships():
     )
 
 
-dp.create_streaming_table(
-    name=SDP_MEMBERSHIP_CURRENT_TABLE_NAME,
-    comment="Current realtime segment membership flags maintained by Auto CDC SCD Type 1 for Lakebase sync.",
-    table_properties={"delta.enableChangeDataFeed": "true"},
-    cluster_by=["profile_id", "segment_id"],
-    schema="""
-      event_id STRING,
-      run_id STRING,
-      profile_id STRING,
-      segment_id STRING,
-      path STRING,
-      event_ts LONG,
-      qualified_at TIMESTAMP,
-      source_event_id STRING,
-      processed_at TIMESTAMP,
-      is_member BOOLEAN
-    """,
-)
+@dp.foreach_batch_sink(name="realtime_membership_qualification_sink")
+def qualify_realtime_memberships(events, batch_id: int) -> None:
+    spark_session = events.sparkSession
+    _ensure_membership_delta_tables(spark_session)
 
-dp.create_auto_cdc_flow(
-    target=SDP_MEMBERSHIP_CURRENT_TABLE_NAME,
-    source=SDP_MEMBERSHIP_TABLE_NAME,
-    keys=["profile_id", "segment_id", "path"],
-    sequence_by=F.struct("event_ts", "event_id"),
-    stored_as_scd_type=1,
-    name=f"{SDP_FLOW_NAME}_current_state",
-)
+    rules = _load_realtime_rules(spark_session)
+    if not rules:
+        return
+    attribute_mapping = _load_attribute_mapping(spark_session)
+    memberships = _evaluate_membership_batch(events, rules, attribute_mapping)
+    if memberships.isEmpty():
+        return
+
+    memberships.persist()
+    try:
+        (
+            memberships.write.format("delta")
+            .mode("append")
+            .option("txnVersion", batch_id)
+            .option("txnAppId", APP_ID)
+            .saveAsTable(SDP_MEMBERSHIP_TABLE_NAME)
+        )
+        memberships.createOrReplaceTempView("_cdp_rt_membership_batch")
+        spark_session.sql(
+            f"""
+            MERGE INTO {SDP_MEMBERSHIP_CURRENT_TABLE_NAME} AS target
+            USING (
+              SELECT event_id, run_id, profile_id, segment_id, path, event_ts,
+                     qualified_at, source_event_id, processed_at, is_member
+              FROM (
+                SELECT *,
+                       row_number() OVER (
+                         PARTITION BY profile_id, segment_id, path
+                         ORDER BY event_ts DESC, event_id DESC
+                       ) AS rn
+                FROM _cdp_rt_membership_batch
+              )
+              WHERE rn = 1
+            ) AS source
+            ON target.profile_id = source.profile_id
+               AND target.segment_id = source.segment_id
+               AND target.path = source.path
+            WHEN MATCHED AND (
+                target.event_ts IS NULL
+                OR struct(target.event_ts, target.event_id) <= struct(source.event_ts, source.event_id)
+              )
+              THEN UPDATE SET *
+            WHEN NOT MATCHED
+              THEN INSERT *
+            """
+        )
+    finally:
+        memberships.unpersist()
+
+
+@dp.append_flow(target="realtime_membership_qualification_sink", name=f"{SDP_FLOW_NAME}_per_microbatch")
+def qualify_realtime_memberships_flow():
+    return spark.readStream.table(SDP_EVENT_TABLE_NAME)
