@@ -14,6 +14,12 @@ resources:
           default: "/Volumes/${var.catalog}/${var.schema}/${var.volume}/rules/FrequentShipAbandonEmail_Segment_JSON.csv"
         - name: attribute_mapping_table_name
           default: ${var.attribute_mapping_table_name}
+        - name: source_event_table_name
+          default: ${var.source_event_table_name}
+        - name: profile_table_name
+          default: ${var.profile_table_name}
+        - name: account_table_name
+          default: ${var.account_table_name}
       performance_target: PERFORMANCE_OPTIMIZED
       environments:
         - environment_key: cdp_serverless
@@ -31,6 +37,9 @@ resources:
             base_parameters:
               rules_csv_path: "{{job.parameters.rules_csv_path}}"
               attribute_mapping_table_name: "{{job.parameters.attribute_mapping_table_name}}"
+              source_event_table_name: "{{job.parameters.source_event_table_name}}"
+              profile_table_name: "{{job.parameters.profile_table_name}}"
+              account_table_name: "{{job.parameters.account_table_name}}"
 
     cdp_sdp_lakebase_sizing:
       name: "[${bundle.target}] CDP SDP + Lakebase sizing run"

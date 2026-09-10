@@ -307,8 +307,32 @@ NUMERIC_ACCOUNT_OPS = {"gt", "gte", "lt", "lte", "between"}
 
 
 def _normalize_source(source: str) -> str:
-    normalized = source.upper()
+    normalized = source.strip().upper()
     return "ACCOUNT" if normalized == "ACCOUNTS" else normalized
+
+
+def _normalize_table_name(table_name: str) -> str:
+    return table_name.replace("`", "").strip().lower()
+
+
+def _source_role(source: str) -> str:
+    legacy_role = _normalize_source(source)
+    if legacy_role in {"EVENT", "PROFILE", "ACCOUNT"}:
+        return legacy_role
+
+    source_table = _normalize_table_name(source)
+    table_roles = {
+        _normalize_table_name(SOURCE_EVENT_TABLE_NAME): "EVENT",
+        _normalize_table_name(PROFILE_TABLE_NAME): "PROFILE",
+        _normalize_table_name(ACCOUNT_TABLE_NAME): "ACCOUNT",
+    }
+    role = table_roles.get(source_table)
+    if role:
+        return role
+    raise ValueError(
+        f"Unknown segment attribute mapping source {source!r}. "
+        "Expected one of source_event_table_name, profile_table_name, or account_table_name."
+    )
 
 
 def _rule_from_row(row) -> dict:
@@ -350,8 +374,10 @@ def _load_attribute_mapping() -> dict[str, dict[str, str]]:
         raise
     mapping: dict[str, dict[str, str]] = {}
     for row in rows:
+        source_table = str(row["source"])
         mapping[str(row["rule_property"])] = {
-            "source": _normalize_source(str(row["source"])),
+            "source": _source_role(source_table),
+            "source_table": source_table,
             "column_name": str(row["column_name"]),
         }
     return mapping

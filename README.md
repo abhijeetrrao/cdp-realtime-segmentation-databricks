@@ -131,13 +131,29 @@ Configure the table through:
 attribute_mapping_table_name = cdp_prd.aap_processed_data.segment_attribute_mapping
 ```
 
+Example mapping rows:
+
+| rule_property | source | column_name |
+| --- | --- |
+| `DL_C_PageCountryCode` | `cdp_prd.aap_processed_data.<listener_attribute_changes_table>` | `page_country_code` |
+| `AZ_C_EmailAddress` | `cdp_prd.aap_processed_data.segments_aap_profiles` | `email_address` |
+| `AZ_A_NetRev13Week` | `cdp_prd.aap_processed_data.segments_aap_accounts` | `net_rev_13_week` |
+
 Mapping semantics:
 
-| Mapping source | Runtime behavior |
+| Mapping source table | Runtime behavior |
 | --- | --- |
-| `EVENT` | Read `column_name` from the streaming listener Delta table. The reverse-index trigger accepts either `rule_property` or `column_name` in `changed_properties`. |
-| `PROFILE` | Read `column_name` from the profile table configured by `profile_table_name`. |
-| `ACCOUNT` | Read `column_name` from the account table configured by `account_table_name`, join through the profile table's semicolon-delimited `accounts` list to `account_group_id`, and aggregate to profile level before evaluation. |
+| Same as `source_event_table_name` | Read `column_name` from the streaming listener Delta table. The reverse-index trigger accepts either `rule_property` or `column_name` in `changed_properties`. |
+| Same as `profile_table_name` | Read `column_name` from the profile table. |
+| Same as `account_table_name` | Read `column_name` from the account table, join through the profile table's semicolon-delimited `accounts` list to `account_group_id`, and aggregate to profile level before evaluation. |
+
+The table names in `source` are compared to the configured pipeline table names. For the customer deployment, make sure these match:
+
+```text
+source_event_table_name = cdp_prd.aap_processed_data.<listener_attribute_changes_table>
+profile_table_name = cdp_prd.aap_processed_data.segments_aap_profiles
+account_table_name = cdp_prd.aap_processed_data.segments_aap_accounts
+```
 
 If a rule property is missing from the mapping table, the pipeline falls back to naming conventions:
 
@@ -146,6 +162,8 @@ AZ_A_* -> ACCOUNT
 DL_* or beh_* -> EVENT
 everything else -> PROFILE
 ```
+
+For compatibility, mapping `source` values of `EVENT`, `PROFILE`, `ACCOUNT`, and `ACCOUNTS` are still accepted, but the customer table should use physical Databricks table names.
 
 ## Repository Layout
 
@@ -412,9 +430,9 @@ Property source handling:
 
 | Rule property | Source behavior |
 | --- | --- |
-| Mapped `source = EVENT` | Read the mapped `column_name` from the streaming listener/source table. |
-| Mapped `source = PROFILE` | Read the mapped `column_name` from `cdp_prd.aap_processed_data.segments_aap_profiles`. |
-| Mapped `source = ACCOUNT` | Read the mapped `column_name` from `cdp_prd.aap_processed_data.segments_aap_accounts`, bridge through profile `accounts`, and aggregate to profile level. |
+| Mapped `source` equals `source_event_table_name` | Read the mapped `column_name` from the streaming listener/source table. |
+| Mapped `source` equals `profile_table_name` | Read the mapped `column_name` from `cdp_prd.aap_processed_data.segments_aap_profiles`. |
+| Mapped `source` equals `account_table_name` | Read the mapped `column_name` from `cdp_prd.aap_processed_data.segments_aap_accounts`, bridge through profile `accounts`, and aggregate to profile level. |
 | Unmapped `source: "ACCOUNTS"` or `AZ_A_*` | Fallback to account table using the rule property as the physical column name. |
 | Unmapped `DL_*` or `beh_*` | Fallback to event/source table using the rule property as the physical column name. |
 | Other unmapped properties | Fallback to profile table using the rule property as the physical column name. |

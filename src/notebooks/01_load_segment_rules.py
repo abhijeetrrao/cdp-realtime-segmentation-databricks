@@ -17,6 +17,9 @@ from cdp_engine.rules import leaf_rules
 c = cfg()
 rules_csv_path = widget("rules_csv_path", volume_path(c, "rules/FrequentShipAbandonEmail_Segment_JSON.csv"))
 attribute_mapping_table_name = widget("attribute_mapping_table_name", "segment_attribute_mapping")
+source_event_table_name = widget("source_event_table_name", "")
+profile_table_name = widget("profile_table_name", "profile_attributes_delta")
+account_table_name = widget("account_table_name", "account_attributes_delta")
 
 create_namespace(c)
 
@@ -70,6 +73,35 @@ def parse_trigger_properties(rule_json: str) -> list[str]:
     return sorted(props)
 
 
+def normalize_source(source: str) -> str:
+    normalized = source.strip().upper()
+    return "ACCOUNT" if normalized == "ACCOUNTS" else normalized
+
+
+def normalize_table_name(table_name: str) -> str:
+    return table_name.replace("`", "").strip().lower()
+
+
+def source_role(source: str) -> str:
+    legacy_role = normalize_source(source)
+    if legacy_role in {"EVENT", "PROFILE", "ACCOUNT"}:
+        return legacy_role
+
+    source_table = normalize_table_name(source)
+    table_roles = {
+        normalize_table_name(source_event_table_name): "EVENT",
+        normalize_table_name(profile_table_name): "PROFILE",
+        normalize_table_name(account_table_name): "ACCOUNT",
+    }
+    role = table_roles.get(source_table)
+    if role:
+        return role
+    raise ValueError(
+        f"Unknown segment attribute mapping source {source!r}. "
+        "Expected one of source_event_table_name, profile_table_name, or account_table_name."
+    )
+
+
 def load_attribute_mapping() -> dict[str, dict[str, str]]:
     try:
         rows = (
@@ -82,7 +114,8 @@ def load_attribute_mapping() -> dict[str, dict[str, str]]:
         return {}
     return {
         str(row["rule_property"]): {
-            "source": "ACCOUNT" if str(row["source"]).upper() == "ACCOUNTS" else str(row["source"]).upper(),
+            "source": source_role(str(row["source"])),
+            "source_table": str(row["source"]),
             "column_name": str(row["column_name"]),
         }
         for row in rows
@@ -138,6 +171,9 @@ print(
         {
             "rules_csv_path": rules_csv_path,
             "attribute_mapping_table_name": attribute_mapping_table_name,
+            "source_event_table_name": source_event_table_name,
+            "profile_table_name": profile_table_name,
+            "account_table_name": account_table_name,
             "mapped_properties": len(attribute_mapping),
             "segment_rules_loaded": rules.count(),
             "reverse_index_rows": reverse_index.count(),
