@@ -228,6 +228,7 @@ Configure these bundle variables before deployment:
 | `profile_accounts_col` | `accounts` |
 | `account_table_name` | `cdp_prd.aap_processed_data.segments_aap_accounts` |
 | `account_profile_id_col` | `profile_id` |
+| `account_id_col` | `account_group_id` |
 | `segment_definitions_table_name` | `<catalog>.<schema>.segment_definitions_delta` or `segment_definitions_delta` |
 
 Update `databricks.yml` for the target workspace host, or pass `--profile` with a profile whose host points to the customer workspace.
@@ -379,7 +380,7 @@ profile_table_name = cdp_prd.aap_processed_data.segments_aap_profiles
 account_table_name = cdp_prd.aap_processed_data.segments_aap_accounts
 ```
 
-For the customer profile table, set `profile_accounts_col = accounts`. If `segments_aap_accounts` has a direct profile key, set `account_profile_id_col`; otherwise the pipeline joins `segments_aap_profiles.accounts` to `segments_aap_accounts.account_id` and aggregates account metrics across the matched accounts.
+For the customer profile table, set `profile_accounts_col = accounts`. If `segments_aap_accounts` has a direct profile key, set `account_profile_id_col`; otherwise the pipeline joins `segments_aap_profiles.accounts` to `segments_aap_accounts.account_group_id` and aggregates account metrics across the matched accounts.
 
 ## Sizing Notes From the Stress Test
 

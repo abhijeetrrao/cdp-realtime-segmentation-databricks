@@ -41,7 +41,7 @@ variables:
   account_profile_id_col:
     default: profile_id
   account_id_col:
-    default: account_id
+    default: account_group_id
   segment_definitions_table_name:
     default: segment_definitions_delta
 
