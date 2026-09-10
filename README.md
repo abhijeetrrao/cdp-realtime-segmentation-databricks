@@ -44,6 +44,7 @@ Delta/Unity Catalog tables:
 | `profile_attributes_delta` | Synthetic wide profile table. The generated schema contains deterministic profile, account, and filler attributes so the table behaves like a wide customer profile record. |
 | `account_attributes_delta` | Synthetic account attributes. Profiles reference accounts by `account_id`. |
 | `segment_definitions_delta` | Segment definitions as JSON rules. Each row includes `segment_id`, `mode`, `rule_json`, and `referenced_properties`. |
+| `segment_attribute_mapping` | Maps customer rule attribute names to physical Databricks columns and source tables. |
 | `segment_reverse_index_delta` | Precomputed `property_name -> segment_ids` fanout table for realtime rules. Useful for observability and for implementations that explicitly join through a reverse index. |
 | customer listener table | Physical Delta table produced by the Tealium listener process. Configure through `source_event_table_name`. This replaces direct Event Hub reads for the customer flow. |
 | `tealium_eventhub_events_<run_id>` | SDP streaming table containing parsed and filtered Event Hub events for a sizing run. |
@@ -104,6 +105,47 @@ events
 ```
 
 That avoids reparsing rules in the hot path and makes fanout directly observable.
+
+## Attribute Mapping Table
+
+Customer rules can keep customer/CDP attribute names such as `AZ_A_NetRev13Week`, `AZ_C_EmailAddress`, and `DL_C_PageCountryCode`. The pipeline resolves those names through a Delta mapping table before reading physical Databricks columns.
+
+Expected schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS cdp_prd.aap_processed_data.segment_attribute_mapping (
+  rule_property STRING NOT NULL,
+  source STRING NOT NULL,
+  column_name STRING NOT NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp()
+)
+USING DELTA
+TBLPROPERTIES (
+  delta.enableChangeDataFeed = true
+);
+```
+
+Configure the table through:
+
+```text
+attribute_mapping_table_name = cdp_prd.aap_processed_data.segment_attribute_mapping
+```
+
+Mapping semantics:
+
+| Mapping source | Runtime behavior |
+| --- | --- |
+| `EVENT` | Read `column_name` from the streaming listener Delta table. The reverse-index trigger accepts either `rule_property` or `column_name` in `changed_properties`. |
+| `PROFILE` | Read `column_name` from the profile table configured by `profile_table_name`. |
+| `ACCOUNT` | Read `column_name` from the account table configured by `account_table_name`, join through the profile table's semicolon-delimited `accounts` list to `account_group_id`, and aggregate to profile level before evaluation. |
+
+If a rule property is missing from the mapping table, the pipeline falls back to naming conventions:
+
+```text
+AZ_A_* -> ACCOUNT
+DL_* or beh_* -> EVENT
+everything else -> PROFILE
+```
 
 ## Repository Layout
 
@@ -230,6 +272,7 @@ Configure these bundle variables before deployment:
 | `account_profile_id_col` | `profile_id` |
 | `account_id_col` | `account_group_id` |
 | `segment_definitions_table_name` | `<catalog>.<schema>.segment_definitions_delta` or `segment_definitions_delta` |
+| `attribute_mapping_table_name` | `<catalog>.<schema>.segment_attribute_mapping` or `segment_attribute_mapping` |
 
 Update `databricks.yml` for the target workspace host, or pass `--profile` with a profile whose host points to the customer workspace.
 
@@ -369,9 +412,12 @@ Property source handling:
 
 | Rule property | Source behavior |
 | --- | --- |
-| `source: "ACCOUNTS"` or `AZ_A_*` | Read from the account table and aggregate to profile level. If the account table has no profile key, the pipeline splits the profile table's semicolon-delimited `accounts` column and joins those account IDs to the account table. Numeric comparison fields are summed across all accounts for the profile. Non-numeric account fields are collected so predicates can match any account value. |
-| Column present in the listener/source table | Read from the streaming source row. |
-| Other properties | Read from the profile table. Customer `AZ_C_*` fields are expected to come from `cdp_prd.aap_processed_data.segments_aap_profiles`. |
+| Mapped `source = EVENT` | Read the mapped `column_name` from the streaming listener/source table. |
+| Mapped `source = PROFILE` | Read the mapped `column_name` from `cdp_prd.aap_processed_data.segments_aap_profiles`. |
+| Mapped `source = ACCOUNT` | Read the mapped `column_name` from `cdp_prd.aap_processed_data.segments_aap_accounts`, bridge through profile `accounts`, and aggregate to profile level. |
+| Unmapped `source: "ACCOUNTS"` or `AZ_A_*` | Fallback to account table using the rule property as the physical column name. |
+| Unmapped `DL_*` or `beh_*` | Fallback to event/source table using the rule property as the physical column name. |
+| Other unmapped properties | Fallback to profile table using the rule property as the physical column name. |
 
 For the customer sample, configure:
 

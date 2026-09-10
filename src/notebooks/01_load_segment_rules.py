@@ -12,10 +12,11 @@ import json
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from cdp_engine.rules import trigger_properties
+from cdp_engine.rules import leaf_rules
 
 c = cfg()
 rules_csv_path = widget("rules_csv_path", volume_path(c, "rules/FrequentShipAbandonEmail_Segment_JSON.csv"))
+attribute_mapping_table_name = widget("attribute_mapping_table_name", "segment_attribute_mapping")
 
 create_namespace(c)
 
@@ -54,10 +55,42 @@ def parse_referenced_properties(rule_json: str) -> list[str]:
 def parse_trigger_properties(rule_json: str) -> list[str]:
     if not rule_json:
         return []
-    return sorted(trigger_properties(json.loads(rule_json)))
+    rule = json.loads(rule_json)
+    props = set()
+    for leaf in leaf_rules(rule):
+        rule_property = leaf["property"]
+        mapped = attribute_mapping.get(rule_property)
+        if mapped:
+            if mapped["source"] == "EVENT":
+                props.add(rule_property)
+                props.add(mapped["column_name"])
+            continue
+        if rule_property.startswith("DL_") or rule_property.startswith("beh_"):
+            props.add(rule_property)
+    return sorted(props)
+
+
+def load_attribute_mapping() -> dict[str, dict[str, str]]:
+    try:
+        rows = (
+            spark.read.table(attribute_mapping_table_name)
+            .select("rule_property", "source", "column_name")
+            .where("rule_property IS NOT NULL AND source IS NOT NULL AND column_name IS NOT NULL")
+            .collect()
+        )
+    except Exception:
+        return {}
+    return {
+        str(row["rule_property"]): {
+            "source": "ACCOUNT" if str(row["source"]).upper() == "ACCOUNTS" else str(row["source"]).upper(),
+            "column_name": str(row["column_name"]),
+        }
+        for row in rows
+    }
 
 
 referenced_udf = F.udf(parse_referenced_properties, T.ArrayType(T.StringType()))
+attribute_mapping = load_attribute_mapping()
 trigger_udf = F.udf(parse_trigger_properties, T.ArrayType(T.StringType()))
 
 rules = (
@@ -104,6 +137,8 @@ print(
     json.dumps(
         {
             "rules_csv_path": rules_csv_path,
+            "attribute_mapping_table_name": attribute_mapping_table_name,
+            "mapped_properties": len(attribute_mapping),
             "segment_rules_loaded": rules.count(),
             "reverse_index_rows": reverse_index.count(),
         },

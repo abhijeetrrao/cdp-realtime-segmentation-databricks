@@ -16,7 +16,7 @@ except Exception:
 if _src and _src not in sys.path:
     sys.path.append(_src)
 
-from cdp_engine.rules import account_properties, leaf_rules, trigger_properties
+from cdp_engine.rules import leaf_rules
 
 
 LAKEBASE_ENDPOINT = spark.conf.get("lakebase_endpoint")
@@ -39,6 +39,7 @@ ACCOUNT_TABLE_NAME = spark.conf.get("account_table_name", "account_attributes_de
 ACCOUNT_PROFILE_ID_COL = spark.conf.get("account_profile_id_col", "profile_id")
 ACCOUNT_ID_COL = spark.conf.get("account_id_col", "account_group_id")
 SEGMENT_DEFINITIONS_TABLE_NAME = spark.conf.get("segment_definitions_table_name", "segment_definitions_delta")
+ATTRIBUTE_MAPPING_TABLE_NAME = spark.conf.get("attribute_mapping_table_name", "segment_attribute_mapping")
 SDP_EVENT_TABLE_NAME = spark.conf.get("sdp_event_table_name", "tealium_eventhub_events")
 SDP_MEMBERSHIP_TABLE_NAME = spark.conf.get("sdp_membership_table_name", "evaluated_realtime_memberships")
 SDP_MEMBERSHIP_CURRENT_TABLE_NAME = spark.conf.get("sdp_membership_current_table_name", "membership_flags_current")
@@ -305,6 +306,11 @@ def _compare(left: F.Column, op: F.Column, right: F.Column) -> F.Column:
 NUMERIC_ACCOUNT_OPS = {"gt", "gte", "lt", "lte", "between"}
 
 
+def _normalize_source(source: str) -> str:
+    normalized = source.upper()
+    return "ACCOUNT" if normalized == "ACCOUNTS" else normalized
+
+
 def _rule_from_row(row) -> dict:
     value = row["rule_json"]
     return json.loads(value) if isinstance(value, str) else value
@@ -327,19 +333,71 @@ def _load_realtime_rules() -> list[dict]:
     ]
 
 
-def _rule_trigger_properties(rules: list[dict]) -> list[str]:
+def _load_attribute_mapping() -> dict[str, dict[str, str]]:
+    if not ATTRIBUTE_MAPPING_TABLE_NAME:
+        return {}
+    try:
+        rows = (
+            spark.read.table(ATTRIBUTE_MAPPING_TABLE_NAME)
+            .select("rule_property", "source", "column_name")
+            .where("rule_property IS NOT NULL AND source IS NOT NULL AND column_name IS NOT NULL")
+            .collect()
+        )
+    except Exception as exc:
+        message = str(exc)
+        if "TABLE_OR_VIEW_NOT_FOUND" in message or "not found" in message.lower() or "cannot be found" in message.lower():
+            return {}
+        raise
+    mapping: dict[str, dict[str, str]] = {}
+    for row in rows:
+        mapping[str(row["rule_property"])] = {
+            "source": _normalize_source(str(row["source"])),
+            "column_name": str(row["column_name"]),
+        }
+    return mapping
+
+
+def _property_mapping(rule_property: str, attribute_mapping: dict[str, dict[str, str]]) -> dict[str, str]:
+    mapped = attribute_mapping.get(rule_property)
+    if mapped:
+        return mapped
+    if rule_property.startswith("AZ_A_"):
+        return {"source": "ACCOUNT", "column_name": rule_property}
+    if rule_property.startswith("DL_") or rule_property.startswith("beh_"):
+        return {"source": "EVENT", "column_name": rule_property}
+    return {"source": "PROFILE", "column_name": rule_property}
+
+
+def _leaf_source(leaf: dict, attribute_mapping: dict[str, dict[str, str]]) -> str:
+    if _normalize_source(str(leaf.get("source", ""))) == "ACCOUNT":
+        return "ACCOUNT"
+    return _property_mapping(leaf["property"], attribute_mapping)["source"]
+
+
+def _leaf_column_name(leaf: dict, attribute_mapping: dict[str, dict[str, str]]) -> str:
+    return _property_mapping(leaf["property"], attribute_mapping)["column_name"]
+
+
+def _rule_trigger_properties(rules: list[dict], attribute_mapping: dict[str, dict[str, str]]) -> list[str]:
     props: set[str] = set()
     for segment in rules:
-        props.update(trigger_properties(segment["rule"]))
+        for leaf in leaf_rules(segment["rule"]):
+            if _leaf_source(leaf, attribute_mapping) == "EVENT":
+                props.add(leaf["property"])
+                props.add(_leaf_column_name(leaf, attribute_mapping))
     return sorted(props)
 
 
-def _segment_trigger_dataframe(rules: list[dict]):
+def _segment_trigger_dataframe(rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
     rows = []
     for segment in rules:
-        triggers = sorted(trigger_properties(segment["rule"]))
+        triggers = set()
+        for leaf in leaf_rules(segment["rule"]):
+            if _leaf_source(leaf, attribute_mapping) == "EVENT":
+                triggers.add(leaf["property"])
+                triggers.add(_leaf_column_name(leaf, attribute_mapping))
         if triggers:
-            rows.append((segment["segment_id"], triggers))
+            rows.append((segment["segment_id"], sorted(triggers)))
     return spark.createDataFrame(rows, "segment_id string, trigger_properties array<string>")
 
 
@@ -465,28 +523,49 @@ def _date_array_expr(left: F.Column, predicate) -> F.Column:
     return F.coalesce(F.exists(left, lambda item: predicate(_timestamp(item))), F.lit(False))
 
 
-def _resolve_rule_value(leaf: dict, event_cols: set[str], profile_cols: set[str], account_cols: set[str], account_array_props: set[str]) -> tuple[F.Column, bool]:
-    prop = leaf["property"]
-    is_account = leaf.get("source") == "ACCOUNTS" or prop.startswith("AZ_A_")
-    if is_account:
-        column = _column("a", prop, account_cols)
+def _resolve_rule_value(
+    leaf: dict,
+    attribute_mapping: dict[str, dict[str, str]],
+    event_cols: set[str],
+    profile_cols: set[str],
+    account_cols: set[str],
+    account_array_props: set[str],
+) -> tuple[F.Column, bool]:
+    rule_property = leaf["property"]
+    source = _leaf_source(leaf, attribute_mapping)
+    column_name = _leaf_column_name(leaf, attribute_mapping)
+    if source == "ACCOUNT":
+        column = _column("a", rule_property, account_cols)
         if column is not None:
-            return column, prop in account_array_props
+            return column, rule_property in account_array_props
 
-    column = _column("e", prop, event_cols)
-    if column is not None:
-        return column, False
+    if source == "EVENT":
+        column = _column("e", column_name, event_cols)
+        if column is None:
+            column = _column("e", rule_property, event_cols)
+        if column is not None:
+            return column, False
 
-    column = _column("p", prop, profile_cols)
-    if column is not None:
-        return column, False
+    if source == "PROFILE":
+        column = _column("p", column_name, profile_cols)
+        if column is None:
+            column = _column("p", rule_property, profile_cols)
+        if column is not None:
+            return column, False
 
     return F.lit(None).cast("string"), False
 
 
-def _compile_leaf(leaf: dict, event_cols: set[str], profile_cols: set[str], account_cols: set[str], account_array_props: set[str]) -> F.Column:
+def _compile_leaf(
+    leaf: dict,
+    attribute_mapping: dict[str, dict[str, str]],
+    event_cols: set[str],
+    profile_cols: set[str],
+    account_cols: set[str],
+    account_array_props: set[str],
+) -> F.Column:
     op = leaf["op"]
-    left, is_array = _resolve_rule_value(leaf, event_cols, profile_cols, account_cols, account_array_props)
+    left, is_array = _resolve_rule_value(leaf, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
     right = leaf.get("value")
 
     if op == "exists":
@@ -531,33 +610,39 @@ def _compile_leaf(leaf: dict, event_cols: set[str], profile_cols: set[str], acco
     raise ValueError(f"Unsupported rule operator for Spark evaluation: {op}")
 
 
-def _compile_rule(rule: dict, event_cols: set[str], profile_cols: set[str], account_cols: set[str], account_array_props: set[str]) -> F.Column:
+def _compile_rule(
+    rule: dict,
+    attribute_mapping: dict[str, dict[str, str]],
+    event_cols: set[str],
+    profile_cols: set[str],
+    account_cols: set[str],
+    account_array_props: set[str],
+) -> F.Column:
     op = rule["op"]
     if op == "and":
-        children = [_compile_rule(child, event_cols, profile_cols, account_cols, account_array_props) for child in rule["rules"]]
+        children = [_compile_rule(child, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props) for child in rule["rules"]]
         out = F.lit(True)
         for child in children:
             out = out & child
         return out
     if op == "or":
-        children = [_compile_rule(child, event_cols, profile_cols, account_cols, account_array_props) for child in rule["rules"]]
+        children = [_compile_rule(child, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props) for child in rule["rules"]]
         out = F.lit(False)
         for child in children:
             out = out | child
         return out
     if op == "not":
-        return ~_compile_rule(rule["rule"], event_cols, profile_cols, account_cols, account_array_props)
-    return _compile_leaf(rule, event_cols, profile_cols, account_cols, account_array_props)
+        return ~_compile_rule(rule["rule"], attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
+    return _compile_leaf(rule, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
 
 
-def _account_property_modes(rules: list[dict]) -> tuple[set[str], set[str]]:
+def _account_property_modes(rules: list[dict], attribute_mapping: dict[str, dict[str, str]]) -> tuple[set[str], set[str]]:
     numeric_props: set[str] = set()
     array_props: set[str] = set()
     for segment in rules:
-        account_props = account_properties(segment["rule"])
         for leaf in leaf_rules(segment["rule"]):
             prop = leaf["property"]
-            if prop not in account_props:
+            if _leaf_source(leaf, attribute_mapping) != "ACCOUNT":
                 continue
             if leaf["op"] in NUMERIC_ACCOUNT_OPS:
                 numeric_props.add(prop)
@@ -580,47 +665,87 @@ def _profile_account_bridge(profiles):
     )
 
 
-def _aggregate_accounts(rules: list[dict], profiles):
+def _account_projection(accounts, account_cols: set[str], rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
+    selected = []
+    seen = set()
+    for segment in rules:
+        for leaf in leaf_rules(segment["rule"]):
+            rule_property = leaf["property"]
+            if rule_property in seen or _leaf_source(leaf, attribute_mapping) != "ACCOUNT":
+                continue
+            column_name = _leaf_column_name(leaf, attribute_mapping)
+            if column_name in account_cols:
+                selected.append(F.col(f"`{column_name}`").alias(rule_property))
+                seen.add(rule_property)
+    return selected, seen
+
+
+def _effective_account_id_col(account_cols: set[str]) -> str | None:
+    if ACCOUNT_ID_COL in account_cols:
+        return ACCOUNT_ID_COL
+    if "account_id" in account_cols:
+        return "account_id"
+    return None
+
+
+def _aggregate_accounts(rules: list[dict], profiles, attribute_mapping: dict[str, dict[str, str]]):
     accounts = spark.read.table(ACCOUNT_TABLE_NAME)
     account_cols = set(accounts.columns)
-    numeric_props, array_props = _account_property_modes(rules)
+    account_id_col = _effective_account_id_col(account_cols)
+    numeric_props, array_props = _account_property_modes(rules, attribute_mapping)
+    account_value_cols, projected_account_props = _account_projection(accounts, account_cols, rules, attribute_mapping)
     aggregations = []
     for prop in sorted(numeric_props):
-        if prop in account_cols:
+        if prop in projected_account_props:
             aggregations.append(F.sum(F.col(f"`{prop}`").cast("double")).alias(prop))
     for prop in sorted(array_props):
-        if prop in account_cols:
+        if prop in projected_account_props:
             aggregations.append(F.collect_set(F.col(f"`{prop}`").cast("string")).alias(prop))
     if not aggregations:
         return None
     if ACCOUNT_PROFILE_ID_COL in account_cols:
-        return accounts.groupBy(F.col(f"`{ACCOUNT_PROFILE_ID_COL}`").cast("string").alias("profile_id")).agg(*aggregations)
-    if ACCOUNT_ID_COL in account_cols:
+        account_values = accounts.select(
+            F.col(f"`{ACCOUNT_PROFILE_ID_COL}`").cast("string").alias("profile_id"),
+            *account_value_cols,
+        )
+        return account_values.groupBy("profile_id").agg(*aggregations)
+    if account_id_col:
         bridge = _profile_account_bridge(profiles)
         if bridge is not None:
-            account_props = sorted((numeric_props | array_props) & account_cols)
+            account_values = accounts.select(
+                F.col(f"`{account_id_col}`").cast("string").alias("account_id"),
+                *account_value_cols,
+            )
             joined = bridge.alias("b").join(
-                accounts.alias("acct"),
-                F.col("b.account_id") == F.col(f"acct.`{ACCOUNT_ID_COL}`").cast("string"),
+                account_values.alias("acct"),
+                F.col("b.account_id") == F.col("acct.account_id"),
                 "inner",
-            ).select(
-                F.col("b.profile_id"),
-                *[F.col(f"acct.`{prop}`").alias(prop) for prop in account_props],
             )
             return joined.groupBy("profile_id").agg(*aggregations)
-    if ACCOUNT_ID_COL in account_cols:
-        return accounts.groupBy(F.col(f"`{ACCOUNT_ID_COL}`").cast("string").alias("account_id")).agg(*aggregations)
+    if account_id_col:
+        account_values = accounts.select(
+            F.col(f"`{account_id_col}`").cast("string").alias("account_id"),
+            *account_value_cols,
+        )
+        return account_values.groupBy("account_id").agg(*aggregations)
     raise ValueError(
         f"Account table {ACCOUNT_TABLE_NAME!r} must contain {ACCOUNT_PROFILE_ID_COL!r} or {ACCOUNT_ID_COL!r}"
     )
 
 
-def _compiled_membership_expr(rules: list[dict], event_cols: set[str], profile_cols: set[str], account_cols: set[str], account_array_props: set[str]) -> F.Column:
+def _compiled_membership_expr(
+    rules: list[dict],
+    attribute_mapping: dict[str, dict[str, str]],
+    event_cols: set[str],
+    profile_cols: set[str],
+    account_cols: set[str],
+    account_array_props: set[str],
+) -> F.Column:
     out = F.lit(False)
     for segment in rules:
         out = F.when(
             F.col("e.segment_id") == F.lit(segment["segment_id"]),
-            _compile_rule(segment["rule"], event_cols, profile_cols, account_cols, account_array_props),
+            _compile_rule(segment["rule"], attribute_mapping, event_cols, profile_cols, account_cols, account_array_props),
         ).otherwise(out)
     return F.coalesce(out, F.lit(False))
 
@@ -631,7 +756,9 @@ def _compiled_membership_expr(rules: list[dict], event_cols: set[str], profile_c
     cluster_by=["run_id", "profile_id"],
 )
 def tealium_eventhub_events():
-    trigger_props = _rule_trigger_properties(_load_realtime_rules())
+    rules = _load_realtime_rules()
+    attribute_mapping = _load_attribute_mapping()
+    trigger_props = _rule_trigger_properties(rules, attribute_mapping)
     events = (
         _read_source_events(trigger_props)
         .where("event_id IS NOT NULL AND profile_id IS NOT NULL")
@@ -654,15 +781,16 @@ def tealium_eventhub_events():
 )
 def evaluated_realtime_memberships():
     rules = _load_realtime_rules()
-    segment_triggers = F.broadcast(_segment_trigger_dataframe(rules)).alias("st")
+    attribute_mapping = _load_attribute_mapping()
+    segment_triggers = F.broadcast(_segment_trigger_dataframe(rules, attribute_mapping)).alias("st")
     events = spark.readStream.table(SDP_EVENT_TABLE_NAME).alias("e")
     profiles_base = (
         spark.read.table(PROFILE_TABLE_NAME)
         .withColumn("profile_id", F.col(f"`{PROFILE_ID_COL}`").cast("string"))
     )
     profiles = profiles_base.alias("p")
-    account_agg = _aggregate_accounts(rules, profiles_base)
-    account_array_props = _account_property_modes(rules)[1]
+    account_agg = _aggregate_accounts(rules, profiles_base, attribute_mapping)
+    account_array_props = _account_property_modes(rules, attribute_mapping)[1]
 
     joined = events.join(
         segment_triggers,
@@ -681,7 +809,7 @@ def evaluated_realtime_memberships():
 
     event_cols = set(events.columns)
     profile_cols = set(profiles.columns)
-    membership_expr = _compiled_membership_expr(rules, event_cols, profile_cols, account_cols, account_array_props)
+    membership_expr = _compiled_membership_expr(rules, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
     return joined.select(
         F.col("e.event_id"),
         F.col("e.run_id"),

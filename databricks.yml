@@ -44,6 +44,8 @@ variables:
     default: account_group_id
   segment_definitions_table_name:
     default: segment_definitions_delta
+  attribute_mapping_table_name:
+    default: segment_attribute_mapping
 
 include:
   - resources/*.yml

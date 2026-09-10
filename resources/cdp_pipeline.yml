@@ -36,6 +36,7 @@ resources:
         account_profile_id_col: ${var.account_profile_id_col}
         account_id_col: ${var.account_id_col}
         segment_definitions_table_name: ${var.segment_definitions_table_name}
+        attribute_mapping_table_name: ${var.attribute_mapping_table_name}
         cdp_schema: "cdp_rt"
         pipelines.numUpdateRetryAttempts: "0"
         pipelines.maxFlowRetryAttempts: "0"
