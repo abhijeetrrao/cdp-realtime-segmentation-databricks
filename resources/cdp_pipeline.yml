@@ -24,6 +24,17 @@ resources:
         eventhub_name: ${var.eventhub_name}
         eventhub_secret_scope: ${var.eventhub_secret_scope}
         eventhub_secret_key: ${var.eventhub_secret_key}
+        source_event_table_name: ${var.source_event_table_name}
+        source_profile_id_col: ${var.source_profile_id_col}
+        source_event_id_col: ${var.source_event_id_col}
+        source_event_ts_col: ${var.source_event_ts_col}
+        source_changed_properties_col: ${var.source_changed_properties_col}
+        profile_table_name: ${var.profile_table_name}
+        profile_id_col: ${var.profile_id_col}
+        account_table_name: ${var.account_table_name}
+        account_profile_id_col: ${var.account_profile_id_col}
+        account_id_col: ${var.account_id_col}
+        segment_definitions_table_name: ${var.segment_definitions_table_name}
         cdp_schema: "cdp_rt"
         pipelines.numUpdateRetryAttempts: "0"
         pipelines.maxFlowRetryAttempts: "0"

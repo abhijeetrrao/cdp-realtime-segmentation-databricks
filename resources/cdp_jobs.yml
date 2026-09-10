@@ -1,5 +1,34 @@
 resources:
   jobs:
+    cdp_load_customer_segment_rules:
+      name: "[${bundle.target}] CDP load customer segment rules"
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: volume
+          default: ${var.volume}
+        - name: rules_csv_path
+          default: "/Volumes/${var.catalog}/${var.schema}/${var.volume}/rules/FrequentShipAbandonEmail_Segment_JSON.csv"
+      performance_target: PERFORMANCE_OPTIMIZED
+      environments:
+        - environment_key: cdp_serverless
+          spec:
+            client: "4"
+            dependencies:
+              - --editable ${workspace.file_path}
+              - databricks-sdk>=0.40.0
+      tasks:
+        - task_key: load_segment_rules
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/01_load_segment_rules.py
+            source: WORKSPACE
+            base_parameters:
+              rules_csv_path: "{{job.parameters.rules_csv_path}}"
+
     cdp_sdp_lakebase_sizing:
       name: "[${bundle.target}] CDP SDP + Lakebase sizing run"
       max_concurrent_runs: 1

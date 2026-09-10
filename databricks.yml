@@ -20,6 +20,28 @@ variables:
     default: cdp-rt
   eventhub_secret_key:
     default: eventhub-connection-string
+  source_event_table_name:
+    default: ""
+  source_profile_id_col:
+    default: profile_id
+  source_event_id_col:
+    default: event_id
+  source_event_ts_col:
+    default: event_ts
+  source_changed_properties_col:
+    default: changed_properties
+  profile_table_name:
+    default: profile_attributes_delta
+  profile_id_col:
+    default: profile_id
+  account_table_name:
+    default: account_attributes_delta
+  account_profile_id_col:
+    default: profile_id
+  account_id_col:
+    default: account_id
+  segment_definitions_table_name:
+    default: segment_definitions_delta
 
 include:
   - resources/*.yml

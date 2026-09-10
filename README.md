@@ -5,32 +5,33 @@ This repository contains a deployable Databricks Asset Bundle for a real-time CD
 The implementation is intended for a customer-site deployment where we need to prove the end-to-end shape quickly:
 
 ```text
-Event Hub -> Databricks SDP -> Delta current membership -> Lakebase synced table -> serving reads
+Tealium listener Delta table -> Databricks SDP -> Delta current membership -> Lakebase synced table -> serving reads
 ```
 
 ## Current Architecture
 
 The current optimized path is the SDP pipeline in `src/pipelines/realtime/realtime_segmentation_pipeline.py`.
 
-1. Events are read from Azure Event Hub through the Kafka-compatible endpoint.
-2. Events are parsed into a structured schema.
-3. Events with no realtime-relevant changed properties are filtered out.
+1. Attribute-change events are read from a physical Delta table with `spark.readStream.table(...)`.
+2. The source table is expected to contain `profile_id`, event time, event ID, `changed_properties`, and the listener/behavioral attributes being updated.
+3. Rows with no realtime-relevant changed properties are filtered out.
 4. Realtime segment definitions are read from Delta.
-5. The event's `changed_properties` are used as a reverse-index trigger to identify candidate segments.
-6. Candidate segment rows are joined with profile/account attributes from Delta.
-7. Spark evaluates the stateless boolean rule:
+5. The row's `changed_properties` are used as a reverse-index trigger to identify candidate segments.
+6. Candidate segment rows are joined with profile attributes from Delta.
+7. Account-sourced rule properties are aggregated to profile level before evaluation. Numeric comparison fields are summed across the profile's accounts; string/date-style account fields are collected so `contains`/date predicates can match any account value.
+8. Spark evaluates the stateless nested boolean rule:
 
    ```text
-   event behavioral condition AND profile/account attribute condition
+   listener/behavioral conditions AND profile conditions AND aggregated account conditions
    ```
 
-8. Auto CDC / SCD Type 1 maintains the latest current membership per:
+9. Auto CDC / SCD Type 1 maintains the latest current membership per:
 
    ```text
    profile_id, segment_id, path
    ```
 
-9. The current membership table is synced to Lakebase/Postgres for keyed serving reads.
+10. The current membership table is synced to Lakebase/Postgres for keyed serving reads.
 
 The qualification computation is stateless. The pipeline does not keep session windows or cross-event state. The only stateful piece is the current-state table that stores the latest membership flag for each profile/segment/path key.
 
@@ -44,6 +45,7 @@ Delta/Unity Catalog tables:
 | `account_attributes_delta` | Synthetic account attributes. Profiles reference accounts by `account_id`. |
 | `segment_definitions_delta` | Segment definitions as JSON rules. Each row includes `segment_id`, `mode`, `rule_json`, and `referenced_properties`. |
 | `segment_reverse_index_delta` | Precomputed `property_name -> segment_ids` fanout table for realtime rules. Useful for observability and for implementations that explicitly join through a reverse index. |
+| customer listener table | Physical Delta table produced by the Tealium listener process. Configure through `source_event_table_name`. This replaces direct Event Hub reads for the customer flow. |
 | `tealium_eventhub_events_<run_id>` | SDP streaming table containing parsed and filtered Event Hub events for a sizing run. |
 | `evaluated_realtime_memberships_<run_id>` | SDP table with one evaluated row per event/profile/candidate segment. |
 | `membership_flags_current_<run_id>` | Auto CDC current-state table. This is the table intended to sync into Lakebase. |
@@ -134,16 +136,16 @@ That avoids reparsing rules in the hot path and makes fanout directly observable
 
 | File | What it does |
 | --- | --- |
-| `src/pipelines/realtime/realtime_segmentation_pipeline.py` | Current realtime segmentation pipeline. Reads Event Hub, filters actionable events, evaluates candidate segment rules in Spark, and uses Auto CDC SCD Type 1 to maintain current membership. This is the main customer-demo path. |
+| `src/pipelines/realtime/realtime_segmentation_pipeline.py` | Current realtime segmentation pipeline. Streams from the configured Delta listener table, filters actionable rows, evaluates nested customer segment rules in Spark, and uses Auto CDC SCD Type 1 to maintain current membership. This is the main customer-demo path. |
 
 Key functions/tables in the SDP pipeline:
 
 | Object | Purpose |
 | --- | --- |
-| `REALTIME_EVENT_PROPERTIES` | Behavioral event properties that can trigger realtime segment evaluation. |
+| rule trigger properties | Non-account properties extracted from realtime segment rules. These are matched against `changed_properties` to decide which segments to evaluate. |
 | `EVENT_SCHEMA` | Schema used to parse Event Hub messages. |
-| `tealium_eventhub_events()` | Streaming table reading Kafka/Event Hub, parsing JSON, filtering invalid events, filtering events whose `changed_properties` have no realtime rule overlap, and optionally filtering to a `run_id`. |
-| `evaluated_realtime_memberships()` | Joins filtered events to candidate realtime segment rules and profile attributes, evaluates the event condition plus profile/account condition, and emits one row per evaluated candidate membership. |
+| `tealium_eventhub_events()` | Streaming table reading the configured Delta listener table, normalizing the event contract, filtering invalid rows, filtering rows whose `changed_properties` have no realtime rule overlap, and optionally filtering to a `run_id`. Event Hub remains only as a synthetic fallback when `source_event_table_name` is empty. |
+| `evaluated_realtime_memberships()` | Joins filtered rows to candidate realtime segment rules, profile attributes, and aggregated account attributes, evaluates the nested rule, and emits one row per evaluated candidate membership. |
 | `membership_flags_current_<run_id>` | Auto CDC target table holding the current latest membership state. |
 | `dp.create_auto_cdc_flow(...)` | Maintains SCD Type 1 current membership keyed by `profile_id`, `segment_id`, and `path`. |
 
@@ -152,7 +154,8 @@ Key functions/tables in the SDP pipeline:
 | File | What it does |
 | --- | --- |
 | `src/notebooks/00_common.py` | Shared notebook utilities for widgets, config, Unity Catalog names, volume paths, Event Hub Kafka options, and Lakebase credentials. |
-| `src/notebooks/01_generate_delta.py` | Creates synthetic accounts, profiles, realtime segment definitions, batch segment definitions, and the Delta reverse-index table. Run this first. |
+| `src/notebooks/01_generate_delta.py` | Creates synthetic accounts, profiles, realtime segment definitions, batch segment definitions, and the Delta reverse-index table. Use this for synthetic sandbox runs. |
+| `src/notebooks/01_load_segment_rules.py` | Loads customer segment rules from a CSV into `segment_definitions_delta` and rebuilds `segment_reverse_index_delta`. Use this for the customer rules CSV. |
 | `src/notebooks/02_lakebase_init_and_sync.py` | Creates Lakebase/Postgres schemas and tables, then syncs segment definitions, reverse index, and a configurable profile subset into Lakebase. Required for legacy direct-write tests and useful for debugging. |
 | `src/notebooks/03_eventhub_generator.py` | Generates synthetic Tealium-like events and sends them to Azure Event Hub. The event payload includes behavioral properties and `changed_properties`. |
 | `src/notebooks/05_batch_segments.py` | Demonstrates batch segment evaluation and writes batch membership flags into Lakebase. This is separate from realtime SDP qualification. |
@@ -219,6 +222,12 @@ Configure these bundle variables before deployment:
 | `eventhub_name` | `tealium-events` |
 | `eventhub_secret_scope` | `cdp-rt` |
 | `eventhub_secret_key` | `eventhub-connection-string` |
+| `source_event_table_name` | `cdp_prd.aap_processed_data.<listener_attribute_changes_table>` |
+| `profile_table_name` | `cdp_prd.aap_processed_data.segments_aap_profiles` |
+| `profile_id_col` | `profile_id` |
+| `account_table_name` | `cdp_prd.aap_processed_data.segments_aap_accounts` |
+| `account_profile_id_col` | `profile_id` |
+| `segment_definitions_table_name` | `<catalog>.<schema>.segment_definitions_delta` or `segment_definitions_delta` |
 
 Update `databricks.yml` for the target workspace host, or pass `--profile` with a profile whose host points to the customer workspace.
 
@@ -246,6 +255,12 @@ Run setup:
 
 ```bash
 databricks bundle run cdp_realtime_segmentation_setup -t dev --profile customer
+```
+
+Load customer segment rules from a CSV staged in a UC volume:
+
+```bash
+databricks bundle run cdp_load_customer_segment_rules -t dev --profile customer
 ```
 
 Run the current SDP + Lakebase sizing flow:
@@ -287,7 +302,17 @@ cdp_rt.membership_flags_current_<sizing_run_id>
 
 ## Event Payload Contract
 
-Each Event Hub message is JSON matching:
+For the customer flow, the SDP pipeline reads a Delta table rather than Event Hub. The source table should contain these logical fields, with configurable column names:
+
+| Logical field | Default column | Purpose |
+| --- | --- | --- |
+| Profile key | `profile_id` | Profile-level evaluation key. |
+| Event/update ID | `event_id` | Stable ID for ordering/tie-breaking and lineage. |
+| Event/update timestamp | `event_ts` | Milliseconds since epoch or timestamp/string parseable by Spark. |
+| Changed properties | `changed_properties` | `ARRAY<STRING>` or JSON string array naming attributes changed by the listener. |
+| Listener attributes | property names from rules | Values such as `DL_C_LastShippingCompleted` or `DL_C_PageCountryCode`. |
+
+The old Event Hub synthetic harness used JSON messages shaped like:
 
 ```json
 {
@@ -304,11 +329,17 @@ Each Event Hub message is JSON matching:
 }
 ```
 
-Only events with `event_id`, `profile_id`, and overlap between `changed_properties` and `REALTIME_EVENT_PROPERTIES` enter the evaluation path.
+Only rows with `event_id`, `profile_id`, and overlap between `changed_properties` and rule trigger properties enter the evaluation path. If the source table does not contain `changed_properties`, the pipeline treats each row as potentially changing every trigger property, which is useful for smoke tests but not recommended for production sizing.
 
 ## Segment Rule Contract
 
-The synthetic realtime segment rule shape is:
+Segment definitions are loaded into:
+
+```text
+<catalog>.<schema>.segment_definitions_delta
+```
+
+The rule JSON can be nested. Example:
 
 ```json
 {
@@ -320,19 +351,34 @@ The synthetic realtime segment rule shape is:
 }
 ```
 
-The current Spark evaluator supports this two-condition realtime shape:
+The current Spark evaluator supports nested:
 
 ```text
-one event behavioral condition + one profile/account attribute condition
+and, or, not
 ```
 
-Supported comparison operators in the Spark path:
+Supported leaf operators in the Spark path:
 
 ```text
-eq, neq, gt, gte, lt, lte
+exists, contains, not_contains, eq, neq, gt, gte, lt, lte, between, after, within_last, within_next
 ```
 
-If customer segment definitions require nested boolean logic, `in`, `not`, multiple behavioral clauses, or session-window/stateful logic, extend `evaluated_realtime_memberships()` before running the customer test.
+Property source handling:
+
+| Rule property | Source behavior |
+| --- | --- |
+| `source: "ACCOUNTS"` or `AZ_A_*` | Read from the account table and aggregate to profile level. Numeric comparison fields are summed across all accounts for the profile. Non-numeric account fields are collected so predicates can match any account value. |
+| Column present in the listener/source table | Read from the streaming source row. |
+| Other properties | Read from the profile table. Customer `AZ_C_*` fields are expected to come from `cdp_prd.aap_processed_data.segments_aap_profiles`. |
+
+For the customer sample, configure:
+
+```text
+profile_table_name = cdp_prd.aap_processed_data.segments_aap_profiles
+account_table_name = cdp_prd.aap_processed_data.segments_aap_accounts
+```
+
+If `segments_aap_accounts` does not have one row per `(profile_id, account)` or does not contain `profile_id`, set `account_profile_id_col` or provide a profile-account mapping before running SDP. The account aggregation requires a key that maps account rows back to the profile being evaluated.
 
 ## Sizing Notes From the Stress Test
 
@@ -376,7 +422,7 @@ No events in SDP table:
 Events arrive but no memberships are evaluated:
 
 - Check that `segment_definitions_delta` contains `mode = 'realtime'` rows.
-- Check that realtime rules reference properties in `REALTIME_EVENT_PROPERTIES`.
+- Check that realtime rules have non-account trigger properties present in the source table's `changed_properties`.
 - Check that `profile_attributes_delta` contains matching `profile_id` values.
 
 Membership current table updates but Lakebase is empty:
@@ -405,6 +451,6 @@ High latency:
 - Consent/privacy policy enforcement.
 - Segment authoring UI.
 - Stateful/session-window segment logic.
-- General nested-rule compiler for arbitrary segment definitions.
+- Arbitrary customer identity resolution between profile IDs and account IDs when no profile-account key exists.
 
 Those are deliberate boundaries for the sizing test. Add them only after the realtime evaluation and Lakebase serving path are validated with customer-like event and segment distributions.
