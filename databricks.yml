@@ -22,6 +22,10 @@ variables:
     default: eventhub-connection-string
   source_event_table_name:
     default: ""
+  source_read_change_feed:
+    default: "false"
+  source_cdf_starting_version:
+    default: ""
   source_profile_id_col:
     default: profile_id
   source_event_id_col:

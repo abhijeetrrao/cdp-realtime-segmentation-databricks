@@ -25,6 +25,8 @@ resources:
         eventhub_secret_scope: ${var.eventhub_secret_scope}
         eventhub_secret_key: ${var.eventhub_secret_key}
         source_event_table_name: ${var.source_event_table_name}
+        source_read_change_feed: ${var.source_read_change_feed}
+        source_cdf_starting_version: ${var.source_cdf_starting_version}
         source_profile_id_col: ${var.source_profile_id_col}
         source_event_id_col: ${var.source_event_id_col}
         source_event_ts_col: ${var.source_event_ts_col}

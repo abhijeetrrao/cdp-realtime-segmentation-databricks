@@ -1,6 +1,14 @@
 from datetime import datetime, timedelta, timezone
 
-from cdp_engine.rules import account_properties, eval_rule, referenced_properties, rule_to_sql, trigger_properties
+from cdp_engine.rules import (
+    account_properties,
+    eval_mapped_rule,
+    eval_rule,
+    event_trigger_properties,
+    referenced_properties,
+    rule_to_sql,
+    trigger_properties,
+)
 
 
 def test_eval_rule_and_refs():
@@ -62,3 +70,36 @@ def test_customer_nested_rule_operators():
         "ForceQualifyTestUser",
         "Sample_ID",
     }
+
+
+def test_mapped_rule_evaluation_and_event_triggers():
+    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    rule = {
+        "op": "and",
+        "rules": [
+            {"op": "contains", "property": "DL_C_PageCountryCode", "value": "us"},
+            {"op": "exists", "property": "AZ_C_EmailAddress"},
+            {"op": "gte", "property": "AZ_A_NetRev13Week", "value": 375, "source": "ACCOUNTS"},
+            {"op": "within_last", "property": "DL_C_LastShippingCompleted", "value": "1 days (24 hours)"},
+        ],
+    }
+    mapping = {
+        "DL_C_PageCountryCode": {"source": "EVENT", "column_name": "page_country_code"},
+        "DL_C_LastShippingCompleted": {"source": "EVENT", "column_name": "last_shipping_completed"},
+        "AZ_C_EmailAddress": {"source": "PROFILE", "column_name": "email_address"},
+        "AZ_A_NetRev13Week": {"source": "ACCOUNT", "column_name": "net_rev_13_week"},
+    }
+
+    assert event_trigger_properties(rule, mapping) == [
+        "DL_C_LastShippingCompleted",
+        "DL_C_PageCountryCode",
+        "last_shipping_completed",
+        "page_country_code",
+    ]
+    assert eval_mapped_rule(
+        rule,
+        {"page_country_code": "US", "last_shipping_completed": recent},
+        {"email_address": "person@example.com"},
+        {"net_rev_13_week": "500.0"},
+        mapping,
+    )

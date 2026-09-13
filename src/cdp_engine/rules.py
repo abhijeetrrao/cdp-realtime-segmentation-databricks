@@ -108,6 +108,95 @@ def eval_rule(rule: dict[str, Any], attrs: dict[str, Any], event: dict[str, Any]
     raise ValueError(f"Unsupported rule operator: {op}")
 
 
+def event_trigger_properties(rule: dict[str, Any], attribute_mapping: dict[str, Any] | None = None) -> list[str]:
+    attribute_mapping = attribute_mapping or {}
+    props: set[str] = set()
+    for leaf in leaf_rules(rule):
+        rule_property = str(leaf.get("property", ""))
+        if _leaf_source(leaf, attribute_mapping) == "EVENT":
+            props.add(rule_property)
+            column_name = _leaf_column_name(rule_property, attribute_mapping)
+            if column_name:
+                props.add(column_name)
+    return sorted(props)
+
+
+def eval_mapped_rule(
+    rule: dict[str, Any],
+    event_attrs: dict[str, Any] | None,
+    profile_attrs: dict[str, Any] | None,
+    account_attrs: dict[str, Any] | None,
+    attribute_mapping: dict[str, Any] | None = None,
+) -> bool:
+    attribute_mapping = attribute_mapping or {}
+    event_attrs = event_attrs or {}
+    profile_attrs = profile_attrs or {}
+    account_attrs = account_attrs or {}
+
+    def value_for_leaf(leaf: dict[str, Any]) -> Any:
+        rule_property = str(leaf["property"])
+        source = _leaf_source(leaf, attribute_mapping)
+        column_name = _leaf_column_name(rule_property, attribute_mapping)
+        if source == "EVENT":
+            return event_attrs.get(column_name, event_attrs.get(rule_property))
+        if source == "ACCOUNT":
+            return account_attrs.get(column_name, account_attrs.get(rule_property))
+        return profile_attrs.get(column_name, profile_attrs.get(rule_property))
+
+    def evaluate(node: dict[str, Any]) -> bool:
+        op = node["op"]
+        if op == "and":
+            return all(evaluate(child) for child in node["rules"])
+        if op == "or":
+            return any(evaluate(child) for child in node["rules"])
+        if op == "not":
+            return not evaluate(node["rule"])
+
+        left = value_for_leaf(node)
+        right = node.get("value")
+
+        if op == "eq":
+            return _string_or_native(left) == _string_or_native(right)
+        if op == "neq":
+            return _string_or_native(left) != _string_or_native(right)
+        if op == "gt":
+            return _compare_numeric(left, right, lambda l, r: l > r)
+        if op == "gte":
+            return _compare_numeric(left, right, lambda l, r: l >= r)
+        if op == "lt":
+            return _compare_numeric(left, right, lambda l, r: l < r)
+        if op == "lte":
+            return _compare_numeric(left, right, lambda l, r: l <= r)
+        if op == "in":
+            return str(left) in {str(item) for item in right or []}
+        if op == "exists":
+            return _exists(left)
+        if op == "contains":
+            return _contains(left, right)
+        if op == "not_contains":
+            return not _contains(left, right)
+        if op == "between":
+            low, high = right
+            return _compare_numeric(left, low, lambda l, r: l >= r) and _compare_numeric(left, high, lambda l, r: l <= r)
+        if op == "after":
+            left_dt = _parse_datetime(left)
+            right_dt = _parse_datetime(right)
+            return bool(left_dt and right_dt and left_dt > right_dt)
+        if op == "within_last":
+            left_dt = _parse_datetime(left)
+            delta = _parse_duration(right)
+            now = datetime.now(timezone.utc)
+            return bool(left_dt and delta and now - delta <= left_dt <= now)
+        if op == "within_next":
+            left_dt = _parse_datetime(left)
+            delta = _parse_duration(right)
+            now = datetime.now(timezone.utc)
+            return bool(left_dt and delta and now <= left_dt <= now + delta)
+        raise ValueError(f"Unsupported rule operator: {op}")
+
+    return evaluate(rule)
+
+
 def rule_to_sql(rule: dict[str, Any]) -> str:
     op = rule["op"]
     if op == "and":
@@ -182,6 +271,53 @@ def _contains(left: Any, right: Any) -> bool:
     if isinstance(left, (list, tuple, set)):
         return any(needle in str(item).lower() for item in left if item is not None)
     return needle in str(left).lower()
+
+
+def _string_or_native(value: Any) -> Any:
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _compare_numeric(left: Any, right: Any, predicate) -> bool:
+    try:
+        return predicate(float(left), float(right))
+    except (TypeError, ValueError):
+        return False
+
+
+def _mapping_value(mapping: dict[str, Any], rule_property: str, field: str) -> str | None:
+    value = mapping.get(rule_property)
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(field)
+    if hasattr(value, "asDict"):
+        return value.asDict(recursive=True).get(field)
+    return getattr(value, field, None)
+
+
+def _normalize_source(source: Any) -> str:
+    normalized = str(source or "").strip().upper()
+    return "ACCOUNT" if normalized == "ACCOUNTS" else normalized
+
+
+def _leaf_source(leaf: dict[str, Any], attribute_mapping: dict[str, Any]) -> str:
+    if _normalize_source(leaf.get("source")) == "ACCOUNT":
+        return "ACCOUNT"
+    mapped_source = _mapping_value(attribute_mapping, str(leaf["property"]), "source")
+    if mapped_source:
+        return _normalize_source(mapped_source)
+    rule_property = str(leaf["property"])
+    if rule_property.startswith("AZ_A_"):
+        return "ACCOUNT"
+    if rule_property.startswith("DL_") or rule_property.startswith("beh_"):
+        return "EVENT"
+    return "PROFILE"
+
+
+def _leaf_column_name(rule_property: str, attribute_mapping: dict[str, Any]) -> str:
+    return _mapping_value(attribute_mapping, rule_property, "column_name") or rule_property
 
 
 def _parse_duration(value: Any) -> timedelta | None:

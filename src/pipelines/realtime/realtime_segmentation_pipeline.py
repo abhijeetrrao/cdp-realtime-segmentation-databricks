@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 
 from pyspark import pipelines as dp
@@ -16,7 +15,7 @@ except Exception:
 if _src and _src not in sys.path:
     sys.path.append(_src)
 
-from cdp_engine.rules import leaf_rules
+from cdp_engine.rules import eval_mapped_rule, event_trigger_properties
 
 
 LAKEBASE_ENDPOINT = spark.conf.get("lakebase_endpoint")
@@ -28,6 +27,8 @@ EVENTHUB_SECRET_KEY = spark.conf.get("eventhub_secret_key")
 CDP_SCHEMA = spark.conf.get("cdp_schema", "cdp_rt")
 EVENT_RUN_ID = spark.conf.get("event_run_id", "")
 SOURCE_EVENT_TABLE_NAME = spark.conf.get("source_event_table_name", "")
+SOURCE_READ_CHANGE_FEED = spark.conf.get("source_read_change_feed", "false").lower() == "true"
+SOURCE_CDF_STARTING_VERSION = spark.conf.get("source_cdf_starting_version", "")
 SOURCE_PROFILE_ID_COL = spark.conf.get("source_profile_id_col", "profile_id")
 SOURCE_EVENT_ID_COL = spark.conf.get("source_event_id_col", "event_id")
 SOURCE_EVENT_TS_COL = spark.conf.get("source_event_ts_col", "event_ts")
@@ -43,8 +44,6 @@ ATTRIBUTE_MAPPING_TABLE_NAME = spark.conf.get("attribute_mapping_table_name", "s
 SDP_EVENT_TABLE_NAME = spark.conf.get("sdp_event_table_name", "tealium_eventhub_events")
 SDP_MEMBERSHIP_TABLE_NAME = spark.conf.get("sdp_membership_table_name", "evaluated_realtime_memberships")
 SDP_MEMBERSHIP_CURRENT_TABLE_NAME = spark.conf.get("sdp_membership_current_table_name", "membership_flags_current")
-SDP_FLOW_NAME = spark.conf.get("sdp_flow_name", "qualify_tealium_events")
-APP_ID = "cdp_realtime_segmentation_sdp"
 ALL_TRIGGER_PROPERTIES_SENTINEL = "__ALL_TRIGGER_PROPERTIES__"
 REALTIME_EVENT_PROPERTIES = [
     "beh_page_type",
@@ -304,130 +303,51 @@ def _compare(left: F.Column, op: F.Column, right: F.Column) -> F.Column:
     )
 
 
-NUMERIC_ACCOUNT_OPS = {"gt", "gte", "lt", "lte", "between"}
-
-
-def _normalize_source(source: str) -> str:
-    normalized = source.strip().upper()
-    return "ACCOUNT" if normalized == "ACCOUNTS" else normalized
-
-
 def _normalize_table_name(table_name: str) -> str:
     return table_name.replace("`", "").strip().lower()
 
 
-def _source_role(source: str) -> str:
-    legacy_role = _normalize_source(source)
-    if legacy_role in {"EVENT", "PROFILE", "ACCOUNT"}:
-        return legacy_role
-
-    source_table = _normalize_table_name(source)
-    table_roles = {
-        _normalize_table_name(SOURCE_EVENT_TABLE_NAME): "EVENT",
-        _normalize_table_name(PROFILE_TABLE_NAME): "PROFILE",
-        _normalize_table_name(ACCOUNT_TABLE_NAME): "ACCOUNT",
-    }
-    role = table_roles.get(source_table)
-    if role:
-        return role
-    raise ValueError(
-        f"Unknown segment attribute mapping source {source!r}. "
-        "Expected one of source_event_table_name, profile_table_name, or account_table_name."
+def _source_role_expr(source_col: F.Column) -> F.Column:
+    legacy = F.upper(F.trim(source_col))
+    source_table = F.lower(F.regexp_replace(F.trim(source_col), "`", ""))
+    return (
+        F.when(legacy == F.lit("ACCOUNTS"), F.lit("ACCOUNT"))
+        .when(legacy.isin("EVENT", "PROFILE", "ACCOUNT"), legacy)
+        .when(source_table == F.lit(_normalize_table_name(SOURCE_EVENT_TABLE_NAME)), F.lit("EVENT"))
+        .when(source_table == F.lit(_normalize_table_name(PROFILE_TABLE_NAME)), F.lit("PROFILE"))
+        .when(source_table == F.lit(_normalize_table_name(ACCOUNT_TABLE_NAME)), F.lit("ACCOUNT"))
     )
 
 
-def _rule_from_row(row) -> dict:
-    value = row["rule_json"]
-    return json.loads(value) if isinstance(value, str) else value
-
-
-def _load_realtime_rules(spark_session=None) -> list[dict]:
-    spark_session = spark_session or spark
-    rows = (
-        spark_session.read.table(SEGMENT_DEFINITIONS_TABLE_NAME)
-        .where(F.col("mode") == F.lit("realtime"))
-        .select("segment_id", "segment_name", "rule_json")
-        .collect()
-    )
-    return [
-        {
-            "segment_id": row["segment_id"],
-            "segment_name": row["segment_name"],
-            "rule": _rule_from_row(row),
-        }
-        for row in rows
+MAPPING_VALUE_SCHEMA = T.StructType(
+    [
+        T.StructField("source", T.StringType()),
+        T.StructField("column_name", T.StringType()),
     ]
+)
+ATTRIBUTE_MAPPING_SCHEMA = T.MapType(T.StringType(), MAPPING_VALUE_SCHEMA)
 
 
-def _load_attribute_mapping(spark_session=None) -> dict[str, dict[str, str]]:
-    if not ATTRIBUTE_MAPPING_TABLE_NAME:
-        return {}
-    spark_session = spark_session or spark
-    try:
-        rows = (
-            spark_session.read.table(ATTRIBUTE_MAPPING_TABLE_NAME)
-            .select("rule_property", "source", "column_name")
-            .where("rule_property IS NOT NULL AND source IS NOT NULL AND column_name IS NOT NULL")
-            .collect()
-        )
-    except Exception as exc:
-        message = str(exc)
-        if "TABLE_OR_VIEW_NOT_FOUND" in message or "not found" in message.lower() or "cannot be found" in message.lower():
-            return {}
-        raise
-    mapping: dict[str, dict[str, str]] = {}
-    for row in rows:
-        source_table = str(row["source"])
-        mapping[str(row["rule_property"])] = {
-            "source": _source_role(source_table),
-            "source_table": source_table,
-            "column_name": str(row["column_name"]),
-        }
-    return mapping
+@F.udf(T.ArrayType(T.StringType()))
+def _event_trigger_properties_udf(rule_json: str, attribute_mapping: dict) -> list[str]:
+    if not rule_json:
+        return []
+    rule = json.loads(rule_json) if isinstance(rule_json, str) else rule_json
+    return event_trigger_properties(rule, attribute_mapping or {})
 
 
-def _property_mapping(rule_property: str, attribute_mapping: dict[str, dict[str, str]]) -> dict[str, str]:
-    mapped = attribute_mapping.get(rule_property)
-    if mapped:
-        return mapped
-    if rule_property.startswith("AZ_A_"):
-        return {"source": "ACCOUNT", "column_name": rule_property}
-    if rule_property.startswith("DL_") or rule_property.startswith("beh_"):
-        return {"source": "EVENT", "column_name": rule_property}
-    return {"source": "PROFILE", "column_name": rule_property}
-
-
-def _leaf_source(leaf: dict, attribute_mapping: dict[str, dict[str, str]]) -> str:
-    if _normalize_source(str(leaf.get("source", ""))) == "ACCOUNT":
-        return "ACCOUNT"
-    return _property_mapping(leaf["property"], attribute_mapping)["source"]
-
-
-def _leaf_column_name(leaf: dict, attribute_mapping: dict[str, dict[str, str]]) -> str:
-    return _property_mapping(leaf["property"], attribute_mapping)["column_name"]
-
-
-def _rule_trigger_properties(rules: list[dict], attribute_mapping: dict[str, dict[str, str]]) -> list[str]:
-    props: set[str] = set()
-    for segment in rules:
-        for leaf in leaf_rules(segment["rule"]):
-            if _leaf_source(leaf, attribute_mapping) == "EVENT":
-                props.add(leaf["property"])
-                props.add(_leaf_column_name(leaf, attribute_mapping))
-    return sorted(props)
-
-
-def _segment_trigger_dataframe(spark_session, rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
-    rows = []
-    for segment in rules:
-        triggers = set()
-        for leaf in leaf_rules(segment["rule"]):
-            if _leaf_source(leaf, attribute_mapping) == "EVENT":
-                triggers.add(leaf["property"])
-                triggers.add(_leaf_column_name(leaf, attribute_mapping))
-        if triggers:
-            rows.append((segment["segment_id"], sorted(triggers)))
-    return spark_session.createDataFrame(rows, "segment_id string, trigger_properties array<string>")
+@F.udf(T.BooleanType())
+def _evaluate_mapped_rule_udf(
+    rule_json: str,
+    event_attrs: dict,
+    profile_attrs: dict,
+    account_attrs: dict,
+    attribute_mapping: dict,
+) -> bool:
+    if not rule_json:
+        return False
+    rule = json.loads(rule_json) if isinstance(rule_json, str) else rule_json
+    return bool(eval_mapped_rule(rule, event_attrs, profile_attrs, account_attrs, attribute_mapping or {}))
 
 
 def _as_millis(column: F.Column, data_type: T.DataType) -> F.Column:
@@ -458,21 +378,28 @@ def _array_from_changed_properties(column: F.Column, is_array: bool) -> F.Column
     )
 
 
-def _ensure_event_contract(events, trigger_props: list[str]):
+def _ensure_event_contract(events):
     if SOURCE_PROFILE_ID_COL not in events.columns:
         raise ValueError(f"Source event table must contain profile id column {SOURCE_PROFILE_ID_COL!r}")
 
     out = events.withColumn("profile_id", F.col(f"`{SOURCE_PROFILE_ID_COL}`").cast("string"))
     if SOURCE_EVENT_ID_COL in events.columns:
         out = out.withColumn("event_id", F.col(f"`{SOURCE_EVENT_ID_COL}`").cast("string"))
+    elif "_commit_version" in events.columns:
+        out = out.withColumn(
+            "event_id",
+            F.sha2(F.concat_ws("|", F.col("profile_id"), F.col("_commit_version").cast("string")), 256),
+        )
     else:
         out = out.withColumn(
             "event_id",
-            F.sha2(F.concat_ws("|", F.col("profile_id"), F.monotonically_increasing_id().cast("string")), 256),
+            F.sha2(F.concat_ws("|", F.col("profile_id"), F.expr("uuid()")), 256),
         )
 
     if SOURCE_EVENT_TS_COL in events.columns:
         out = out.withColumn("event_ts", _as_millis(F.col(f"`{SOURCE_EVENT_TS_COL}`"), events.schema[SOURCE_EVENT_TS_COL].dataType))
+    elif "_commit_timestamp" in events.columns:
+        out = out.withColumn("event_ts", (F.unix_timestamp(F.col("_commit_timestamp")) * F.lit(1000)).cast("long"))
     else:
         out = out.withColumn("event_ts", (F.unix_timestamp(F.current_timestamp()) * F.lit(1000)).cast("long"))
 
@@ -490,9 +417,17 @@ def _ensure_event_contract(events, trigger_props: list[str]):
     return out
 
 
-def _read_source_events(trigger_props: list[str]):
+def _read_source_events():
     if SOURCE_EVENT_TABLE_NAME:
-        return _ensure_event_contract(spark.readStream.table(SOURCE_EVENT_TABLE_NAME), trigger_props)
+        reader = spark.readStream
+        if SOURCE_READ_CHANGE_FEED:
+            reader = reader.option("readChangeFeed", "true")
+            if SOURCE_CDF_STARTING_VERSION:
+                reader = reader.option("startingVersion", SOURCE_CDF_STARTING_VERSION)
+            events = reader.table(SOURCE_EVENT_TABLE_NAME).where(F.col("_change_type").isin("insert", "update_postimage"))
+        else:
+            events = reader.table(SOURCE_EVENT_TABLE_NAME)
+        return _ensure_event_contract(events)
 
     return (
         spark.readStream.format("kafka")
@@ -503,181 +438,62 @@ def _read_source_events(trigger_props: list[str]):
     )
 
 
-def _column(alias: str, prop: str, columns: set[str]) -> F.Column | None:
-    if prop not in columns:
-        return None
-    return F.col(f"{alias}.`{prop}`")
+def _empty_string_map() -> F.Column:
+    return F.map_from_arrays(F.array().cast("array<string>"), F.array().cast("array<string>"))
 
 
-def _timestamp(column: F.Column) -> F.Column:
-    text_value = column.cast("string")
-    parsed_ts = F.coalesce(
-        F.to_timestamp(text_value),
-        F.to_timestamp(text_value, "M/d/yyyy h:mm a"),
-        F.to_timestamp(text_value, "M/d/yyyy H:mm"),
+def _string_map(alias: str, columns: list[str], exclude: set[str] | None = None) -> F.Column:
+    exclude = exclude or set()
+    selected = [column for column in columns if column not in exclude and not column.startswith("_")]
+    if not selected:
+        return _empty_string_map()
+    return F.map_from_arrays(
+        F.array(*[F.lit(column) for column in selected]),
+        F.array(*[F.col(f"{alias}.`{column}`").cast("string") for column in selected]),
     )
-    numeric_value = text_value.cast("double")
-    numeric_ts = F.to_timestamp(
-        F.from_unixtime(
-            F.when(numeric_value > F.lit(10_000_000_000), numeric_value / F.lit(1000.0)).otherwise(numeric_value)
+
+
+def _attribute_mapping_snapshot():
+    if not ATTRIBUTE_MAPPING_TABLE_NAME:
+        schema = T.StructType([T.StructField("attribute_mapping", ATTRIBUTE_MAPPING_SCHEMA)])
+        return spark.createDataFrame([({} ,)], schema)
+    mapping_rows = (
+        spark.read.table(ATTRIBUTE_MAPPING_TABLE_NAME)
+        .select(
+            F.col("rule_property").cast("string").alias("rule_property"),
+            _source_role_expr(F.col("source")).alias("source"),
+            F.col("column_name").cast("string").alias("column_name"),
+        )
+        .where("rule_property IS NOT NULL AND source IS NOT NULL AND column_name IS NOT NULL")
+    )
+    return mapping_rows.groupBy().agg(
+        F.map_from_entries(
+            F.collect_list(
+                F.struct(
+                    F.col("rule_property").alias("key"),
+                    F.struct(F.col("source"), F.col("column_name")).alias("value"),
+                )
+            )
+        ).alias("attribute_mapping")
+    )
+
+
+def _rules_with_triggers():
+    rules = (
+        spark.read.table(SEGMENT_DEFINITIONS_TABLE_NAME)
+        .where(F.col("mode") == F.lit("realtime"))
+        .select(
+            F.col("segment_id").cast("string").alias("segment_id"),
+            F.col("segment_name").cast("string").alias("segment_name"),
+            F.col("rule_json").cast("string").alias("rule_json"),
         )
     )
-    return F.coalesce(numeric_ts, parsed_ts)
-
-
-def _duration_interval(value: str) -> str:
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(day|days|hour|hours|minute|minutes)", str(value).lower())
-    if not match:
-        raise ValueError(f"Unsupported duration value: {value!r}")
-    amount = int(float(match.group(1)))
-    unit = match.group(2)
-    if unit.startswith("day"):
-        return f"INTERVAL {amount} DAY"
-    if unit.startswith("hour"):
-        return f"INTERVAL {amount} HOUR"
-    if unit.startswith("minute"):
-        return f"INTERVAL {amount} MINUTE"
-    raise ValueError(f"Unsupported duration unit: {unit!r}")
-
-
-def _contains_expr(left: F.Column, right) -> F.Column:
-    return F.coalesce(F.lower(left.cast("string")).contains(str(right).lower()), F.lit(False))
-
-
-def _array_contains_expr(left: F.Column, right) -> F.Column:
-    return F.coalesce(F.exists(left, lambda item: F.lower(item.cast("string")).contains(str(right).lower())), F.lit(False))
-
-
-def _date_array_expr(left: F.Column, predicate) -> F.Column:
-    return F.coalesce(F.exists(left, lambda item: predicate(_timestamp(item))), F.lit(False))
-
-
-def _resolve_rule_value(
-    leaf: dict,
-    attribute_mapping: dict[str, dict[str, str]],
-    event_cols: set[str],
-    profile_cols: set[str],
-    account_cols: set[str],
-    account_array_props: set[str],
-) -> tuple[F.Column, bool]:
-    rule_property = leaf["property"]
-    source = _leaf_source(leaf, attribute_mapping)
-    column_name = _leaf_column_name(leaf, attribute_mapping)
-    if source == "ACCOUNT":
-        column = _column("a", rule_property, account_cols)
-        if column is not None:
-            return column, rule_property in account_array_props
-
-    if source == "EVENT":
-        column = _column("e", column_name, event_cols)
-        if column is None:
-            column = _column("e", rule_property, event_cols)
-        if column is not None:
-            return column, False
-
-    if source == "PROFILE":
-        column = _column("p", column_name, profile_cols)
-        if column is None:
-            column = _column("p", rule_property, profile_cols)
-        if column is not None:
-            return column, False
-
-    return F.lit(None).cast("string"), False
-
-
-def _compile_leaf(
-    leaf: dict,
-    attribute_mapping: dict[str, dict[str, str]],
-    event_cols: set[str],
-    profile_cols: set[str],
-    account_cols: set[str],
-    account_array_props: set[str],
-) -> F.Column:
-    op = leaf["op"]
-    left, is_array = _resolve_rule_value(leaf, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
-    right = leaf.get("value")
-
-    if op == "exists":
-        if is_array:
-            return F.coalesce(F.size(left) > F.lit(0), F.lit(False))
-        return F.coalesce(left.isNotNull() & (left.cast("string") != F.lit("")), F.lit(False))
-    if op == "contains":
-        return _array_contains_expr(left, right) if is_array else _contains_expr(left, right)
-    if op == "not_contains":
-        return ~(_array_contains_expr(left, right) if is_array else _contains_expr(left, right))
-    if op == "eq":
-        return F.coalesce(left.cast("string") == F.lit(str(right)), F.lit(False))
-    if op == "neq":
-        return F.coalesce(left.cast("string") != F.lit(str(right)), F.lit(False))
-    if op == "in":
-        values = [str(item) for item in right]
-        if is_array:
-            return F.coalesce(F.exists(left, lambda item: item.cast("string").isin(values)), F.lit(False))
-        return F.coalesce(left.cast("string").isin(values), F.lit(False))
-    if op == "gt":
-        return F.coalesce(left.cast("double") > F.lit(float(right)), F.lit(False))
-    if op == "gte":
-        return F.coalesce(left.cast("double") >= F.lit(float(right)), F.lit(False))
-    if op == "lt":
-        return F.coalesce(left.cast("double") < F.lit(float(right)), F.lit(False))
-    if op == "lte":
-        return F.coalesce(left.cast("double") <= F.lit(float(right)), F.lit(False))
-    if op == "between":
-        low, high = right
-        return F.coalesce(left.cast("double").between(float(low), float(high)), F.lit(False))
-    if op == "after":
-        predicate = lambda value: value > F.to_timestamp(F.lit(str(right)), "M/d/yyyy h:mm a")
-        return _date_array_expr(left, predicate) if is_array else F.coalesce(predicate(_timestamp(left)), F.lit(False))
-    if op == "within_last":
-        interval = _duration_interval(str(right))
-        predicate = lambda value: (value >= F.current_timestamp() - F.expr(interval)) & (value <= F.current_timestamp())
-        return _date_array_expr(left, predicate) if is_array else F.coalesce(predicate(_timestamp(left)), F.lit(False))
-    if op == "within_next":
-        interval = _duration_interval(str(right))
-        predicate = lambda value: (value >= F.current_timestamp()) & (value <= F.current_timestamp() + F.expr(interval))
-        return _date_array_expr(left, predicate) if is_array else F.coalesce(predicate(_timestamp(left)), F.lit(False))
-    raise ValueError(f"Unsupported rule operator for Spark evaluation: {op}")
-
-
-def _compile_rule(
-    rule: dict,
-    attribute_mapping: dict[str, dict[str, str]],
-    event_cols: set[str],
-    profile_cols: set[str],
-    account_cols: set[str],
-    account_array_props: set[str],
-) -> F.Column:
-    op = rule["op"]
-    if op == "and":
-        children = [_compile_rule(child, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props) for child in rule["rules"]]
-        out = F.lit(True)
-        for child in children:
-            out = out & child
-        return out
-    if op == "or":
-        children = [_compile_rule(child, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props) for child in rule["rules"]]
-        out = F.lit(False)
-        for child in children:
-            out = out | child
-        return out
-    if op == "not":
-        return ~_compile_rule(rule["rule"], attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
-    return _compile_leaf(rule, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
-
-
-def _account_property_modes(rules: list[dict], attribute_mapping: dict[str, dict[str, str]]) -> tuple[set[str], set[str]]:
-    numeric_props: set[str] = set()
-    array_props: set[str] = set()
-    for segment in rules:
-        for leaf in leaf_rules(segment["rule"]):
-            prop = leaf["property"]
-            if _leaf_source(leaf, attribute_mapping) != "ACCOUNT":
-                continue
-            if leaf["op"] in NUMERIC_ACCOUNT_OPS:
-                numeric_props.add(prop)
-            else:
-                array_props.add(prop)
-    return numeric_props, array_props - numeric_props
+    mapping = _attribute_mapping_snapshot()
+    return (
+        rules.crossJoin(mapping)
+        .withColumn("trigger_properties", _event_trigger_properties_udf(F.col("rule_json"), F.col("attribute_mapping")))
+        .where(F.size(F.col("trigger_properties")) > F.lit(0))
+    )
 
 
 def _profile_account_bridge(profiles):
@@ -694,21 +510,6 @@ def _profile_account_bridge(profiles):
     )
 
 
-def _account_projection(accounts, account_cols: set[str], rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
-    selected = []
-    seen = set()
-    for segment in rules:
-        for leaf in leaf_rules(segment["rule"]):
-            rule_property = leaf["property"]
-            if rule_property in seen or _leaf_source(leaf, attribute_mapping) != "ACCOUNT":
-                continue
-            column_name = _leaf_column_name(leaf, attribute_mapping)
-            if column_name in account_cols:
-                selected.append(F.col(f"`{column_name}`").alias(rule_property))
-                seen.add(rule_property)
-    return selected, seen
-
-
 def _effective_account_id_col(account_cols: set[str]) -> str | None:
     if ACCOUNT_ID_COL in account_cols:
         return ACCOUNT_ID_COL
@@ -717,25 +518,27 @@ def _effective_account_id_col(account_cols: set[str]) -> str | None:
     return None
 
 
-def _aggregate_accounts(spark_session, rules: list[dict], profiles, attribute_mapping: dict[str, dict[str, str]]):
-    accounts = spark_session.read.table(ACCOUNT_TABLE_NAME)
+def _account_attributes_by_profile(profiles):
+    accounts = spark.read.table(ACCOUNT_TABLE_NAME)
     account_cols = set(accounts.columns)
     account_id_col = _effective_account_id_col(account_cols)
-    numeric_props, array_props = _account_property_modes(rules, attribute_mapping)
-    account_value_cols, projected_account_props = _account_projection(accounts, account_cols, rules, attribute_mapping)
+    value_cols = [
+        field
+        for field in accounts.schema.fields
+        if field.name not in {ACCOUNT_ID_COL, ACCOUNT_PROFILE_ID_COL, "account_id", "profile_id"}
+    ]
     aggregations = []
-    for prop in sorted(numeric_props):
-        if prop in projected_account_props:
-            aggregations.append(F.sum(F.col(f"`{prop}`").cast("double")).alias(prop))
-    for prop in sorted(array_props):
-        if prop in projected_account_props:
-            aggregations.append(F.collect_set(F.col(f"`{prop}`").cast("string")).alias(prop))
+    for field in value_cols:
+        if isinstance(field.dataType, (T.ByteType, T.ShortType, T.IntegerType, T.LongType, T.FloatType, T.DoubleType, T.DecimalType)):
+            aggregations.append(F.sum(F.col(f"`{field.name}`").cast("double")).cast("string").alias(field.name))
+        else:
+            aggregations.append(F.concat_ws("\u001f", F.collect_set(F.col(f"`{field.name}`").cast("string"))).alias(field.name))
     if not aggregations:
         return None
     if ACCOUNT_PROFILE_ID_COL in account_cols:
         account_values = accounts.select(
             F.col(f"`{ACCOUNT_PROFILE_ID_COL}`").cast("string").alias("profile_id"),
-            *account_value_cols,
+            *[F.col(f"`{field.name}`") for field in value_cols],
         )
         return account_values.groupBy("profile_id").agg(*aggregations)
     if account_id_col:
@@ -743,7 +546,7 @@ def _aggregate_accounts(spark_session, rules: list[dict], profiles, attribute_ma
         if bridge is not None:
             account_values = accounts.select(
                 F.col(f"`{account_id_col}`").cast("string").alias("account_id"),
-                *account_value_cols,
+                *[F.col(f"`{field.name}`") for field in value_cols],
             )
             joined = bridge.alias("b").join(
                 account_values.alias("acct"),
@@ -754,29 +557,12 @@ def _aggregate_accounts(spark_session, rules: list[dict], profiles, attribute_ma
     if account_id_col:
         account_values = accounts.select(
             F.col(f"`{account_id_col}`").cast("string").alias("account_id"),
-            *account_value_cols,
+            *[F.col(f"`{field.name}`") for field in value_cols],
         )
         return account_values.groupBy("account_id").agg(*aggregations)
     raise ValueError(
         f"Account table {ACCOUNT_TABLE_NAME!r} must contain {ACCOUNT_PROFILE_ID_COL!r} or {ACCOUNT_ID_COL!r}"
     )
-
-
-def _compiled_membership_expr(
-    rules: list[dict],
-    attribute_mapping: dict[str, dict[str, str]],
-    event_cols: set[str],
-    profile_cols: set[str],
-    account_cols: set[str],
-    account_array_props: set[str],
-) -> F.Column:
-    out = F.lit(False)
-    for segment in rules:
-        out = F.when(
-            F.col("e.segment_id") == F.lit(segment["segment_id"]),
-            _compile_rule(segment["rule"], attribute_mapping, event_cols, profile_cols, account_cols, account_array_props),
-        ).otherwise(out)
-    return F.coalesce(out, F.lit(False))
 
 
 @dp.table(
@@ -786,7 +572,7 @@ def _compiled_membership_expr(
 )
 def tealium_eventhub_events():
     events = (
-        _read_source_events([])
+        _read_source_events()
         .where("event_id IS NOT NULL AND profile_id IS NOT NULL")
     )
     if EVENT_RUN_ID:
@@ -794,62 +580,23 @@ def tealium_eventhub_events():
     return events
 
 
-def _ensure_membership_delta_tables(spark_session) -> None:
-    spark_session.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SDP_MEMBERSHIP_TABLE_NAME} (
-          event_id STRING,
-          run_id STRING,
-          profile_id STRING,
-          segment_id STRING,
-          path STRING,
-          event_ts LONG,
-          qualified_at TIMESTAMP,
-          source_event_id STRING,
-          processed_at TIMESTAMP,
-          is_member BOOLEAN
-        )
-        USING DELTA
-        TBLPROPERTIES (delta.enableChangeDataFeed = true)
-        """
-    )
-    spark_session.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SDP_MEMBERSHIP_CURRENT_TABLE_NAME} (
-          event_id STRING,
-          run_id STRING,
-          profile_id STRING,
-          segment_id STRING,
-          path STRING,
-          event_ts LONG,
-          qualified_at TIMESTAMP,
-          source_event_id STRING,
-          processed_at TIMESTAMP,
-          is_member BOOLEAN
-        )
-        USING DELTA
-        TBLPROPERTIES (delta.enableChangeDataFeed = true)
-        """
-    )
-
-
-def _evaluate_membership_batch(events, rules: list[dict], attribute_mapping: dict[str, dict[str, str]]):
-    spark_session = events.sparkSession
-    segment_triggers = F.broadcast(_segment_trigger_dataframe(spark_session, rules, attribute_mapping)).alias("st")
-    events = events.alias("e")
-    profiles_base = (
-        spark_session.read.table(PROFILE_TABLE_NAME)
-        .withColumn("profile_id", F.col(f"`{PROFILE_ID_COL}`").cast("string"))
-    )
+@dp.table(
+    name=SDP_MEMBERSHIP_TABLE_NAME,
+    comment="Spark-evaluated candidate realtime segment memberships.",
+    cluster_by=["profile_id", "segment_id"],
+)
+def evaluated_realtime_memberships():
+    events = spark.readStream.table(SDP_EVENT_TABLE_NAME).alias("e")
+    rules = F.broadcast(_rules_with_triggers()).alias("r")
+    profiles_base = spark.read.table(PROFILE_TABLE_NAME).withColumn("profile_id", F.col(f"`{PROFILE_ID_COL}`").cast("string"))
     profiles = profiles_base.alias("p")
-    account_agg = _aggregate_accounts(spark_session, rules, profiles_base, attribute_mapping)
-    account_array_props = _account_property_modes(rules, attribute_mapping)[1]
+    account_agg = _account_attributes_by_profile(profiles_base)
 
     joined = events.join(
-        segment_triggers,
+        rules,
         F.array_contains(F.col("e.changed_properties"), ALL_TRIGGER_PROPERTIES_SENTINEL)
-        | F.arrays_overlap(F.col("e.changed_properties"), F.col("st.trigger_properties")),
-    ).select("e.*", F.col("st.segment_id"))
+        | F.arrays_overlap(F.col("e.changed_properties"), F.col("r.trigger_properties")),
+    ).select("e.*", F.col("r.segment_id"), F.col("r.rule_json"), F.col("r.attribute_mapping"))
 
     joined = joined.alias("e").join(profiles, F.col("e.profile_id") == F.col("p.profile_id"))
     if account_agg is not None:
@@ -858,81 +605,54 @@ def _evaluate_membership_batch(events, rules: list[dict], attribute_mapping: dic
             joined = joined.join(account_agg.alias("a"), F.col("e.profile_id") == F.col("a.profile_id"), "left")
         else:
             joined = joined.join(account_agg.alias("a"), F.col("p.account_id").cast("string") == F.col("a.account_id"), "left")
+        account_attrs = _string_map("a", account_agg.columns, {"profile_id", "account_id"})
     else:
-        account_cols = set()
+        account_attrs = _empty_string_map()
 
-    event_cols = set(events.columns)
-    profile_cols = set(profiles.columns)
-    membership_expr = _compiled_membership_expr(rules, attribute_mapping, event_cols, profile_cols, account_cols, account_array_props)
+    event_attrs = _string_map("e", events.columns)
+    profile_attrs = _string_map("p", profiles.columns, {"profile_id"})
     return joined.select(
-        F.col("e.event_id"),
         F.col("e.run_id"),
         F.col("e.profile_id"),
         F.col("e.segment_id"),
         F.lit("realtime").alias("path"),
-        F.col("e.event_ts"),
-        F.to_timestamp(F.from_unixtime(F.col("e.event_ts") / F.lit(1000))).alias("qualified_at"),
         F.col("e.event_id").alias("source_event_id"),
+        F.col("e.event_ts").alias("source_event_ts_ms"),
+        F.to_timestamp(F.from_unixtime(F.col("e.event_ts") / F.lit(1000))).alias("qualified_at"),
         F.current_timestamp().alias("processed_at"),
-        membership_expr.alias("is_member"),
+        _evaluate_mapped_rule_udf(
+            F.col("e.rule_json"),
+            event_attrs,
+            profile_attrs,
+            account_attrs,
+            F.col("e.attribute_mapping"),
+        ).alias("is_member"),
     )
 
 
-@dp.foreach_batch_sink(name="realtime_membership_qualification_sink")
-def qualify_realtime_memberships(events, batch_id: int) -> None:
-    spark_session = events.sparkSession
-    _ensure_membership_delta_tables(spark_session)
+dp.create_streaming_table(
+    name=SDP_MEMBERSHIP_CURRENT_TABLE_NAME,
+    comment="Current realtime segment membership flags maintained by Auto CDC SCD Type 1 for Lakebase sync.",
+    table_properties={"delta.enableChangeDataFeed": "true"},
+    cluster_by=["profile_id", "segment_id"],
+    schema="""
+      run_id STRING,
+      profile_id STRING,
+      segment_id STRING,
+      path STRING,
+      source_event_id STRING,
+      source_event_ts_ms LONG,
+      qualified_at TIMESTAMP,
+      processed_at TIMESTAMP,
+      is_member BOOLEAN
+    """,
+)
 
-    rules = _load_realtime_rules(spark_session)
-    if not rules:
-        return
-    attribute_mapping = _load_attribute_mapping(spark_session)
-    memberships = _evaluate_membership_batch(events, rules, attribute_mapping)
-    if memberships.isEmpty():
-        return
-
-    memberships.persist()
-    try:
-        (
-            memberships.write.format("delta")
-            .mode("append")
-            .option("txnVersion", batch_id)
-            .option("txnAppId", APP_ID)
-            .saveAsTable(SDP_MEMBERSHIP_TABLE_NAME)
-        )
-        memberships.createOrReplaceTempView("_cdp_rt_membership_batch")
-        spark_session.sql(
-            f"""
-            MERGE INTO {SDP_MEMBERSHIP_CURRENT_TABLE_NAME} AS target
-            USING (
-              SELECT event_id, run_id, profile_id, segment_id, path, event_ts,
-                     qualified_at, source_event_id, processed_at, is_member
-              FROM (
-                SELECT *,
-                       row_number() OVER (
-                         PARTITION BY profile_id, segment_id, path
-                         ORDER BY event_ts DESC, event_id DESC
-                       ) AS rn
-                FROM _cdp_rt_membership_batch
-              )
-              WHERE rn = 1
-            ) AS source
-            ON target.profile_id = source.profile_id
-               AND target.segment_id = source.segment_id
-               AND target.path = source.path
-            WHEN MATCHED AND (
-                target.event_ts IS NULL
-                OR struct(target.event_ts, target.event_id) <= struct(source.event_ts, source.event_id)
-              )
-              THEN UPDATE SET *
-            WHEN NOT MATCHED
-              THEN INSERT *
-            """
-        )
-    finally:
-        memberships.unpersist()
-
-
-@dp.append_flow(target="realtime_membership_qualification_sink", name=f"{SDP_FLOW_NAME}_per_microbatch")
-def qualify_realtime_memberships_flow():
-    return spark.readStream.table(SDP_EVENT_TABLE_NAME)
+dp.create_auto_cdc_flow(
+    target=SDP_MEMBERSHIP_CURRENT_TABLE_NAME,
+    source=SDP_MEMBERSHIP_TABLE_NAME,
+    keys=["profile_id", "segment_id", "path"],
+    sequence_by=F.struct("source_event_ts_ms", "source_event_id"),
+    stored_as_scd_type=1,
+    name="qualify_tealium_events_current_state",
+)
