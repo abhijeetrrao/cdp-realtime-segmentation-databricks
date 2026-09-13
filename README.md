@@ -18,7 +18,7 @@ The current optimized path is the SDP pipeline in `src/pipelines/realtime/realti
 4. The row's `changed_properties` are used as a reverse-index trigger to identify candidate segments.
 5. Candidate segment rows are joined with profile attributes from Delta.
 6. Account-sourced rule properties are aggregated to profile level before evaluation. The customer profile table's `accounts` column is treated as a semicolon-delimited list of account IDs. Numeric comparison fields are summed across those accounts; string/date-style account fields are collected so `contains`/date predicates can match any account value.
-7. Spark evaluates the stateless nested boolean rule:
+7. Spark evaluates the stateless nested boolean rule with a Pandas UDF. Rule JSON parsing is cached per Python worker by raw `rule_json` string, so repeated candidate rows for the same segment do not reparse the same JSON every time:
 
    ```text
    listener/behavioral conditions AND profile conditions AND aggregated account conditions
@@ -204,7 +204,7 @@ Key functions/tables in the SDP pipeline:
 | rule trigger properties | Non-account properties extracted from realtime segment rules. These are matched against `changed_properties` to decide which segments to evaluate. |
 | `EVENT_SCHEMA` | Schema used to parse Event Hub messages. |
 | `tealium_eventhub_events()` | Streaming table reading the configured Delta listener table, normalizing the event contract, filtering invalid rows, and optionally filtering to a `run_id`. Event Hub remains only as a synthetic fallback when `source_event_table_name` is empty. |
-| `evaluated_realtime_memberships()` | Native SDP streaming table that fans events out to candidate segment rules, joins profile/account attributes, and evaluates nested rules with a recursive UDF. |
+| `evaluated_realtime_memberships()` | Native SDP streaming table that fans events out to candidate segment rules, joins profile/account attributes, and evaluates nested rules with a recursive Pandas UDF. |
 | `membership_flags_current_<run_id>` | Auto CDC target table holding the current latest membership state, keyed by `profile_id`, `segment_id`, and `path`. |
 
 ### Setup and Data Generation Notebooks
@@ -392,7 +392,7 @@ The old Event Hub synthetic harness used JSON messages shaped like:
 }
 ```
 
-Rows need a `profile_id` and either a source event ID or a generated one. Candidate fanout is based on overlap between `changed_properties` and rule trigger properties. If the source table does not contain `changed_properties`, the pipeline treats each row as potentially changing every trigger property, which is useful for smoke tests but not recommended for production sizing.
+Rows need a `profile_id` and either a source event ID or a generated one. Candidate fanout is based on overlap between `changed_properties` and rule trigger properties. If the source table does not contain `changed_properties`, the pipeline treats each row as potentially changing every trigger property, which is useful for smoke tests but not recommended for production sizing. For customer-scale use, the writer that maintains the merged listener table should also write `changed_properties ARRAY<STRING>` because this is the main pruning signal.
 
 ## Segment Rule Contract
 

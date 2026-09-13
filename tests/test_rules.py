@@ -6,6 +6,7 @@ from cdp_engine.rules import (
     eval_rule,
     event_trigger_properties,
     referenced_properties,
+    parse_rule_json,
     rule_to_sql,
     trigger_properties,
 )
@@ -103,3 +104,12 @@ def test_mapped_rule_evaluation_and_event_triggers():
         {"net_rev_13_week": "500.0"},
         mapping,
     )
+
+
+def test_rule_json_parse_cache():
+    parse_rule_json.cache_clear()
+    raw = '{"op": "exists", "property": "AZ_C_EmailAddress"}'
+
+    assert parse_rule_json(raw)["property"] == "AZ_C_EmailAddress"
+    assert parse_rule_json(raw)["op"] == "exists"
+    assert parse_rule_json.cache_info().hits == 1

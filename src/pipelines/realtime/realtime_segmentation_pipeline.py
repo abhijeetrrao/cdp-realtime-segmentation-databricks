@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import sys
 
+import pandas as pd
 from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -15,7 +15,7 @@ except Exception:
 if _src and _src not in sys.path:
     sys.path.append(_src)
 
-from cdp_engine.rules import eval_mapped_rule, event_trigger_properties
+from cdp_engine.rules import eval_mapped_rule_from_json, event_trigger_properties_from_json
 
 
 LAKEBASE_ENDPOINT = spark.conf.get("lakebase_endpoint")
@@ -328,26 +328,50 @@ MAPPING_VALUE_SCHEMA = T.StructType(
 ATTRIBUTE_MAPPING_SCHEMA = T.MapType(T.StringType(), MAPPING_VALUE_SCHEMA)
 
 
-@F.udf(T.ArrayType(T.StringType()))
-def _event_trigger_properties_udf(rule_json: str, attribute_mapping: dict) -> list[str]:
-    if not rule_json:
-        return []
-    rule = json.loads(rule_json) if isinstance(rule_json, str) else rule_json
-    return event_trigger_properties(rule, attribute_mapping or {})
+def _dict_or_empty(value):
+    return value if isinstance(value, dict) else {}
 
 
-@F.udf(T.BooleanType())
+@F.pandas_udf(T.ArrayType(T.StringType()))
+def _event_trigger_properties_udf(rule_json: pd.Series, attribute_mapping: pd.Series) -> pd.Series:
+    return pd.Series(
+        [
+            event_trigger_properties_from_json(raw_rule, _dict_or_empty(mapping)) if isinstance(raw_rule, str) and raw_rule else []
+            for raw_rule, mapping in zip(rule_json, attribute_mapping)
+        ]
+    )
+
+
+@F.pandas_udf(T.BooleanType())
 def _evaluate_mapped_rule_udf(
-    rule_json: str,
-    event_attrs: dict,
-    profile_attrs: dict,
-    account_attrs: dict,
-    attribute_mapping: dict,
-) -> bool:
-    if not rule_json:
-        return False
-    rule = json.loads(rule_json) if isinstance(rule_json, str) else rule_json
-    return bool(eval_mapped_rule(rule, event_attrs, profile_attrs, account_attrs, attribute_mapping or {}))
+    rule_json: pd.Series,
+    event_attrs: pd.Series,
+    profile_attrs: pd.Series,
+    account_attrs: pd.Series,
+    attribute_mapping: pd.Series,
+) -> pd.Series:
+    return pd.Series(
+        [
+            bool(
+                eval_mapped_rule_from_json(
+                    raw_rule,
+                    _dict_or_empty(event),
+                    _dict_or_empty(profile),
+                    _dict_or_empty(account),
+                    _dict_or_empty(mapping),
+                )
+            )
+            if isinstance(raw_rule, str) and raw_rule
+            else False
+            for raw_rule, event, profile, account, mapping in zip(
+                rule_json,
+                event_attrs,
+                profile_attrs,
+                account_attrs,
+                attribute_mapping,
+            )
+        ]
+    )
 
 
 def _as_millis(column: F.Column, data_type: T.DataType) -> F.Column:

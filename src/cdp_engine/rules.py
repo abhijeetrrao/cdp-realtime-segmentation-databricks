@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any
 
 
@@ -106,6 +108,25 @@ def eval_rule(rule: dict[str, Any], attrs: dict[str, Any], event: dict[str, Any]
         delta = _parse_duration(right)
         return bool(left_dt and delta and datetime.now(timezone.utc) <= left_dt <= datetime.now(timezone.utc) + delta)
     raise ValueError(f"Unsupported rule operator: {op}")
+
+
+@lru_cache(maxsize=4096)
+def parse_rule_json(rule_json: str) -> dict[str, Any]:
+    return json.loads(rule_json)
+
+
+def event_trigger_properties_from_json(rule_json: str, attribute_mapping: dict[str, Any] | None = None) -> list[str]:
+    return event_trigger_properties(parse_rule_json(rule_json), attribute_mapping)
+
+
+def eval_mapped_rule_from_json(
+    rule_json: str,
+    event_attrs: dict[str, Any] | None,
+    profile_attrs: dict[str, Any] | None,
+    account_attrs: dict[str, Any] | None,
+    attribute_mapping: dict[str, Any] | None = None,
+) -> bool:
+    return eval_mapped_rule(parse_rule_json(rule_json), event_attrs, profile_attrs, account_attrs, attribute_mapping)
 
 
 def event_trigger_properties(rule: dict[str, Any], attribute_mapping: dict[str, Any] | None = None) -> list[str]:
