@@ -41,6 +41,62 @@ resources:
               profile_table_name: "{{job.parameters.profile_table_name}}"
               account_table_name: "{{job.parameters.account_table_name}}"
 
+    cdp_build_profile_account_features:
+      name: "[${bundle.target}] CDP build profile account features"
+      max_concurrent_runs: 1
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: volume
+          default: ${var.volume}
+        - name: profile_table_name
+          default: ${var.profile_table_name}
+        - name: profile_id_col
+          default: ${var.profile_id_col}
+        - name: profile_accounts_col
+          default: ${var.profile_accounts_col}
+        - name: account_table_name
+          default: ${var.account_table_name}
+        - name: account_profile_id_col
+          default: ${var.account_profile_id_col}
+        - name: account_id_col
+          default: ${var.account_id_col}
+        - name: profile_account_features_table_name
+          default: ${var.profile_account_features_table_name}
+        - name: segment_definitions_table_name
+          default: ${var.segment_definitions_table_name}
+        - name: attribute_mapping_table_name
+          default: ${var.attribute_mapping_table_name}
+        - name: source_event_table_name
+          default: ${var.source_event_table_name}
+      performance_target: PERFORMANCE_OPTIMIZED
+      environments:
+        - environment_key: cdp_serverless
+          spec:
+            client: "4"
+            dependencies:
+              - --editable ${workspace.file_path}
+              - databricks-sdk>=0.40.0
+      tasks:
+        - task_key: build_profile_account_features
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/02_build_profile_account_features.py
+            source: WORKSPACE
+            base_parameters:
+              profile_table_name: "{{job.parameters.profile_table_name}}"
+              profile_id_col: "{{job.parameters.profile_id_col}}"
+              profile_accounts_col: "{{job.parameters.profile_accounts_col}}"
+              account_table_name: "{{job.parameters.account_table_name}}"
+              account_profile_id_col: "{{job.parameters.account_profile_id_col}}"
+              account_id_col: "{{job.parameters.account_id_col}}"
+              profile_account_features_table_name: "{{job.parameters.profile_account_features_table_name}}"
+              segment_definitions_table_name: "{{job.parameters.segment_definitions_table_name}}"
+              attribute_mapping_table_name: "{{job.parameters.attribute_mapping_table_name}}"
+              source_event_table_name: "{{job.parameters.source_event_table_name}}"
+
     cdp_sdp_lakebase_sizing:
       name: "[${bundle.target}] CDP SDP + Lakebase sizing run"
       max_concurrent_runs: 1
@@ -224,9 +280,28 @@ resources:
           notebook_task:
             notebook_path: ../src/notebooks/01_generate_delta.py
             source: WORKSPACE
+        - task_key: build_profile_account_features
+          depends_on:
+            - task_key: generate_delta
+          environment_key: cdp_serverless
+          notebook_task:
+            notebook_path: ../src/notebooks/02_build_profile_account_features.py
+            source: WORKSPACE
+            base_parameters:
+              profile_table_name: ${var.profile_table_name}
+              profile_id_col: ${var.profile_id_col}
+              profile_accounts_col: ${var.profile_accounts_col}
+              account_table_name: ${var.account_table_name}
+              account_profile_id_col: ${var.account_profile_id_col}
+              account_id_col: ${var.account_id_col}
+              profile_account_features_table_name: ${var.profile_account_features_table_name}
+              segment_definitions_table_name: ${var.segment_definitions_table_name}
+              attribute_mapping_table_name: ${var.attribute_mapping_table_name}
+              source_event_table_name: ${var.source_event_table_name}
         - task_key: lakebase_init_and_sync
           depends_on:
             - task_key: generate_delta
+            - task_key: build_profile_account_features
           environment_key: cdp_serverless
           notebook_task:
             notebook_path: ../src/notebooks/02_lakebase_init_and_sync.py

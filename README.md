@@ -15,9 +15,9 @@ The current optimized path is the SDP pipeline in `src/pipelines/realtime/realti
 1. Attribute-change events are read from a physical Delta table with `spark.readStream.table(...)`, or from Delta Change Data Feed with `readChangeFeed=true` when the source table is maintained by `MERGE`.
 2. The source table is expected to contain `profile_id`, event time, event ID, `changed_properties`, and the listener/behavioral attributes being updated. If CDF is used, the pipeline keeps `insert` and `update_postimage` rows.
 3. Realtime segment definitions and attribute mappings are read as static Delta inputs inside the streaming plan. The rules remain rows in the plan; they are not collected into Python literals.
-4. The row's `changed_properties` are used as a reverse-index trigger to identify candidate segments.
-5. Candidate segment rows are joined with profile attributes from Delta.
-6. Account-sourced rule properties are aggregated to profile level before evaluation. The customer profile table's `accounts` column is treated as a semicolon-delimited list of account IDs. Numeric comparison fields are summed across those accounts; string/date-style account fields are collected so `contains`/date predicates can match any account value.
+4. Events are first joined with profile attributes from Delta, so unknown profile IDs are dropped before rule fanout.
+5. The row's `changed_properties` are used as a reverse-index trigger to identify candidate segments.
+6. Account-sourced rule properties are read from a precomputed profile-level account feature table. Build or refresh this table with `src/notebooks/02_build_profile_account_features.py` before running realtime evaluation. The builder reads the current realtime segment rules and attribute mapping, computes only the account columns referenced by those rules, treats the customer profile table's `accounts` column as a semicolon-delimited list of account IDs, joins to the account table, and aggregates account attributes to one `account_attrs` map per profile. Numeric fields are summed across accounts; string/date-style fields are collected so `contains` predicates can match any account value.
 7. Spark evaluates the stateless nested boolean rule with a Pandas UDF. Rule JSON parsing is cached per Python worker by raw `rule_json` string, so repeated candidate rows for the same segment do not reparse the same JSON every time:
 
    ```text
@@ -42,6 +42,7 @@ Delta/Unity Catalog tables:
 | --- | --- |
 | `profile_attributes_delta` | Synthetic wide profile table. The generated schema contains deterministic profile, account, and filler attributes so the table behaves like a wide customer profile record. |
 | `account_attributes_delta` | Synthetic account attributes. Profiles reference accounts by `account_id`. |
+| `profile_account_features_delta` | Rules-driven, precomputed profile-level account attributes used as a realtime lookup. Contains `profile_id`, `account_attrs MAP<STRING, STRING>`, and `updated_at`. |
 | `segment_definitions_delta` | Segment definitions as JSON rules. Each row includes `segment_id`, `mode`, `rule_json`, and `referenced_properties`. |
 | `segment_attribute_mapping` | Maps customer rule attribute names to physical Databricks columns and source tables. |
 | `segment_reverse_index_delta` | Precomputed `property_name -> segment_ids` fanout table for realtime rules. Useful for observability and for implementations that explicitly join through a reverse index. |
@@ -144,7 +145,7 @@ Mapping semantics:
 | --- | --- |
 | Same as `source_event_table_name` | Read `column_name` from the streaming listener Delta table. The reverse-index trigger accepts either `rule_property` or `column_name` in `changed_properties`. |
 | Same as `profile_table_name` | Read `column_name` from the profile table. |
-| Same as `account_table_name` | Read `column_name` from the account table, join through the profile table's semicolon-delimited `accounts` list to `account_group_id`, and aggregate to profile level before evaluation. |
+| Same as `account_table_name` | Read `column_name` from the precomputed profile account feature table. The offline builder uses rules + mappings to decide which account columns to aggregate, then joins through the profile table's semicolon-delimited `accounts` list to `account_group_id` and aggregates account attributes to profile level. |
 
 The table names in `source` are compared to the configured pipeline table names. For the customer deployment, make sure these match:
 
@@ -152,6 +153,7 @@ The table names in `source` are compared to the configured pipeline table names.
 source_event_table_name = cdp_prd.aap_processed_data.<listener_attribute_changes_table>
 profile_table_name = cdp_prd.aap_processed_data.segments_aap_profiles
 account_table_name = cdp_prd.aap_processed_data.segments_aap_accounts
+profile_account_features_table_name = cdp_prd.aap_processed_data.profile_account_features
 ```
 
 If a rule property is missing from the mapping table, the pipeline falls back to naming conventions:
@@ -214,6 +216,7 @@ Key functions/tables in the SDP pipeline:
 | `src/notebooks/00_common.py` | Shared notebook utilities for widgets, config, Unity Catalog names, volume paths, Event Hub Kafka options, and Lakebase credentials. |
 | `src/notebooks/01_generate_delta.py` | Creates synthetic accounts, profiles, realtime segment definitions, batch segment definitions, and the Delta reverse-index table. Use this for synthetic sandbox runs. |
 | `src/notebooks/01_load_segment_rules.py` | Loads customer segment rules from a CSV into `segment_definitions_delta` and rebuilds `segment_reverse_index_delta`. Use this for the customer rules CSV. |
+| `src/notebooks/02_build_profile_account_features.py` | Builds the rules-driven, precomputed profile-level account feature table used by realtime rule evaluation. Run this after the daily/offline account table refresh, and after segment rules or attribute mappings change. |
 | `src/notebooks/02_lakebase_init_and_sync.py` | Creates Lakebase/Postgres schemas and tables, then syncs segment definitions, reverse index, and a configurable profile subset into Lakebase. Required for legacy direct-write tests and useful for debugging. |
 | `src/notebooks/03_eventhub_generator.py` | Generates synthetic Tealium-like events and sends them to Azure Event Hub. The event payload includes behavioral properties and `changed_properties`. |
 | `src/notebooks/05_batch_segments.py` | Demonstrates batch segment evaluation and writes batch membership flags into Lakebase. This is separate from realtime SDP qualification. |

@@ -37,6 +37,7 @@ resources:
         account_table_name: ${var.account_table_name}
         account_profile_id_col: ${var.account_profile_id_col}
         account_id_col: ${var.account_id_col}
+        profile_account_features_table_name: ${var.profile_account_features_table_name}
         segment_definitions_table_name: ${var.segment_definitions_table_name}
         attribute_mapping_table_name: ${var.attribute_mapping_table_name}
         cdp_schema: "cdp_rt"

@@ -39,6 +39,7 @@ PROFILE_ACCOUNTS_COL = spark.conf.get("profile_accounts_col", "accounts")
 ACCOUNT_TABLE_NAME = spark.conf.get("account_table_name", "account_attributes_delta")
 ACCOUNT_PROFILE_ID_COL = spark.conf.get("account_profile_id_col", "profile_id")
 ACCOUNT_ID_COL = spark.conf.get("account_id_col", "account_group_id")
+PROFILE_ACCOUNT_FEATURES_TABLE_NAME = spark.conf.get("profile_account_features_table_name", "profile_account_features_delta")
 SEGMENT_DEFINITIONS_TABLE_NAME = spark.conf.get("segment_definitions_table_name", "segment_definitions_delta")
 ATTRIBUTE_MAPPING_TABLE_NAME = spark.conf.get("attribute_mapping_table_name", "segment_attribute_mapping")
 SDP_EVENT_TABLE_NAME = spark.conf.get("sdp_event_table_name", "tealium_eventhub_events")
@@ -525,72 +526,18 @@ def _rules_with_triggers():
     )
 
 
-def _profile_account_bridge(profiles):
-    profile_cols = set(profiles.columns)
-    if PROFILE_ACCOUNTS_COL not in profile_cols:
+def _profile_account_features_snapshot():
+    if not PROFILE_ACCOUNT_FEATURES_TABLE_NAME:
         return None
-    return (
-        profiles.select(
-            F.col("profile_id"),
-            F.explode(F.split(F.col(f"`{PROFILE_ACCOUNTS_COL}`").cast("string"), ";")).alias("_account_id"),
+    features = spark.read.table(PROFILE_ACCOUNT_FEATURES_TABLE_NAME)
+    if "profile_id" not in features.columns or "account_attrs" not in features.columns:
+        raise ValueError(
+            f"Profile account feature table {PROFILE_ACCOUNT_FEATURES_TABLE_NAME!r} "
+            "must contain profile_id and account_attrs columns"
         )
-        .select("profile_id", F.trim(F.col("_account_id")).alias("account_id"))
-        .where("account_id IS NOT NULL AND account_id <> ''")
-    )
-
-
-def _effective_account_id_col(account_cols: set[str]) -> str | None:
-    if ACCOUNT_ID_COL in account_cols:
-        return ACCOUNT_ID_COL
-    if "account_id" in account_cols:
-        return "account_id"
-    return None
-
-
-def _account_attributes_by_profile(profiles):
-    accounts = spark.read.table(ACCOUNT_TABLE_NAME)
-    account_cols = set(accounts.columns)
-    account_id_col = _effective_account_id_col(account_cols)
-    value_cols = [
-        field
-        for field in accounts.schema.fields
-        if field.name not in {ACCOUNT_ID_COL, ACCOUNT_PROFILE_ID_COL, "account_id", "profile_id"}
-    ]
-    aggregations = []
-    for field in value_cols:
-        if isinstance(field.dataType, (T.ByteType, T.ShortType, T.IntegerType, T.LongType, T.FloatType, T.DoubleType, T.DecimalType)):
-            aggregations.append(F.sum(F.col(f"`{field.name}`").cast("double")).cast("string").alias(field.name))
-        else:
-            aggregations.append(F.concat_ws("\u001f", F.collect_set(F.col(f"`{field.name}`").cast("string"))).alias(field.name))
-    if not aggregations:
-        return None
-    if ACCOUNT_PROFILE_ID_COL in account_cols:
-        account_values = accounts.select(
-            F.col(f"`{ACCOUNT_PROFILE_ID_COL}`").cast("string").alias("profile_id"),
-            *[F.col(f"`{field.name}`") for field in value_cols],
-        )
-        return account_values.groupBy("profile_id").agg(*aggregations)
-    if account_id_col:
-        bridge = _profile_account_bridge(profiles)
-        if bridge is not None:
-            account_values = accounts.select(
-                F.col(f"`{account_id_col}`").cast("string").alias("account_id"),
-                *[F.col(f"`{field.name}`") for field in value_cols],
-            )
-            joined = bridge.alias("b").join(
-                account_values.alias("acct"),
-                F.col("b.account_id") == F.col("acct.account_id"),
-                "inner",
-            )
-            return joined.groupBy("profile_id").agg(*aggregations)
-    if account_id_col:
-        account_values = accounts.select(
-            F.col(f"`{account_id_col}`").cast("string").alias("account_id"),
-            *[F.col(f"`{field.name}`") for field in value_cols],
-        )
-        return account_values.groupBy("account_id").agg(*aggregations)
-    raise ValueError(
-        f"Account table {ACCOUNT_TABLE_NAME!r} must contain {ACCOUNT_PROFILE_ID_COL!r} or {ACCOUNT_ID_COL!r}"
+    return features.select(
+        F.col("profile_id").cast("string").alias("profile_id"),
+        F.col("account_attrs").cast("map<string,string>").alias("account_attrs"),
     )
 
 
@@ -619,22 +566,18 @@ def evaluated_realtime_memberships():
     rules = F.broadcast(_rules_with_triggers()).alias("r")
     profiles_base = spark.read.table(PROFILE_TABLE_NAME).withColumn("profile_id", F.col(f"`{PROFILE_ID_COL}`").cast("string"))
     profiles = profiles_base.alias("p")
-    account_agg = _account_attributes_by_profile(profiles_base)
+    account_features = _profile_account_features_snapshot()
 
-    joined = events.join(
+    joined = events.join(profiles, F.col("e.profile_id") == F.col("p.profile_id"), "inner")
+    joined = joined.join(
         rules,
         F.array_contains(F.col("e.changed_properties"), ALL_TRIGGER_PROPERTIES_SENTINEL)
         | F.arrays_overlap(F.col("e.changed_properties"), F.col("r.trigger_properties")),
-    ).select("e.*", F.col("r.segment_id"), F.col("r.rule_json"), F.col("r.attribute_mapping"))
-
-    joined = joined.alias("e").join(profiles, F.col("e.profile_id") == F.col("p.profile_id"))
-    if account_agg is not None:
-        account_cols = set(account_agg.columns)
-        if "profile_id" in account_cols:
-            joined = joined.join(account_agg.alias("a"), F.col("e.profile_id") == F.col("a.profile_id"), "left")
-        else:
-            joined = joined.join(account_agg.alias("a"), F.col("p.account_id").cast("string") == F.col("a.account_id"), "left")
-        account_attrs = _string_map("a", account_agg.columns, {"profile_id", "account_id"})
+        "inner",
+    )
+    if account_features is not None:
+        joined = joined.join(account_features.alias("a"), F.col("e.profile_id") == F.col("a.profile_id"), "left")
+        account_attrs = F.coalesce(F.col("a.account_attrs"), _empty_string_map())
     else:
         account_attrs = _empty_string_map()
 
@@ -643,18 +586,18 @@ def evaluated_realtime_memberships():
     return joined.select(
         F.col("e.run_id"),
         F.col("e.profile_id"),
-        F.col("e.segment_id"),
+        F.col("r.segment_id"),
         F.lit("realtime").alias("path"),
         F.col("e.event_id").alias("source_event_id"),
         F.col("e.event_ts").alias("source_event_ts_ms"),
         F.to_timestamp(F.from_unixtime(F.col("e.event_ts") / F.lit(1000))).alias("qualified_at"),
         F.current_timestamp().alias("processed_at"),
         _evaluate_mapped_rule_udf(
-            F.col("e.rule_json"),
+            F.col("r.rule_json"),
             event_attrs,
             profile_attrs,
             account_attrs,
-            F.col("e.attribute_mapping"),
+            F.col("r.attribute_mapping"),
         ).alias("is_member"),
     )
 

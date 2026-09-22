@@ -46,6 +46,8 @@ variables:
     default: profile_id
   account_id_col:
     default: account_group_id
+  profile_account_features_table_name:
+    default: profile_account_features_delta
   segment_definitions_table_name:
     default: segment_definitions_delta
   attribute_mapping_table_name:
