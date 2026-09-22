@@ -26,8 +26,6 @@ profile_account_features_table_name = widget("profile_account_features_table_nam
 segment_definitions_table_name = widget("segment_definitions_table_name", "segment_definitions_delta")
 attribute_mapping_table_name = widget("attribute_mapping_table_name", "segment_attribute_mapping")
 
-create_namespace(c)
-
 
 def resolve_table_name(table_name: str) -> str:
     table_name = table_name.strip()
