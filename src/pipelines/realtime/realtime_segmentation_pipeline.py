@@ -395,11 +395,16 @@ def _as_millis(column: F.Column, data_type: T.DataType) -> F.Column:
 
 def _array_from_changed_properties(column: F.Column, is_array: bool) -> F.Column:
     if is_array:
-        return column.cast("array<string>")
-    return F.coalesce(
-        F.from_json(column.cast("string"), "array<string>"),
-        F.array(column.cast("string")),
-    )
+        parsed = column.cast("array<string>")
+    else:
+        parsed = F.coalesce(
+            F.from_json(column.cast("string"), "array<string>"),
+            F.array(column.cast("string")),
+        )
+    return F.when(
+        parsed.isNull() | (F.size(parsed) == F.lit(0)),
+        F.array(F.lit(ALL_TRIGGER_PROPERTIES_SENTINEL)),
+    ).otherwise(parsed)
 
 
 def _ensure_event_contract(events):
