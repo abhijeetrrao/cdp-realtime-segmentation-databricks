@@ -134,7 +134,12 @@ def event_trigger_properties(rule: dict[str, Any], attribute_mapping: dict[str, 
     props: set[str] = set()
     for leaf in leaf_rules(rule):
         rule_property = str(leaf.get("property", ""))
-        if _leaf_source(leaf, attribute_mapping) == "EVENT":
+        is_event_trigger = (
+            _leaf_source(leaf, attribute_mapping) == "EVENT"
+            or rule_property.startswith("DL_")
+            or rule_property.startswith("beh_")
+        )
+        if is_event_trigger:
             props.add(rule_property)
             column_name = _leaf_column_name(rule_property, attribute_mapping)
             if column_name:

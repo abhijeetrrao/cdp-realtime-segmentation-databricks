@@ -530,7 +530,6 @@ def _rules_with_triggers():
     return (
         rules.crossJoin(mapping)
         .withColumn("trigger_properties", _event_trigger_properties_udf(F.col("rule_json"), F.col("attribute_mapping")))
-        .where(F.size(F.col("trigger_properties")) > F.lit(0))
     )
 
 

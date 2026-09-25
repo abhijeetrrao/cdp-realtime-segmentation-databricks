@@ -106,6 +106,32 @@ def test_mapped_rule_evaluation_and_event_triggers():
     )
 
 
+def test_dl_properties_remain_realtime_triggers_when_mapped_to_profile():
+    rule = {
+        "op": "and",
+        "rules": [
+            {"op": "contains", "property": "DL_C_UserLoginState", "value": "logged_in"},
+            {"op": "exists", "property": "AZ_C_EmailAddress"},
+        ],
+    }
+    mapping = {
+        "DL_C_UserLoginState": {"source": "PROFILE", "column_name": "dl_user_login_state"},
+        "AZ_C_EmailAddress": {"source": "PROFILE", "column_name": "email_address"},
+    }
+
+    assert event_trigger_properties(rule, mapping) == [
+        "DL_C_UserLoginState",
+        "dl_user_login_state",
+    ]
+    assert eval_mapped_rule(
+        rule,
+        {},
+        {"dl_user_login_state": "logged_in", "email_address": "person@example.com"},
+        {},
+        mapping,
+    )
+
+
 def test_rule_json_parse_cache():
     parse_rule_json.cache_clear()
     raw = '{"op": "exists", "property": "AZ_C_EmailAddress"}'
