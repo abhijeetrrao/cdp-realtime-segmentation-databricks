@@ -48,7 +48,7 @@ Delta/Unity Catalog tables:
 | `segment_reverse_index_delta` | Precomputed `property_name -> segment_ids` fanout table for realtime rules. Useful for observability and for implementations that explicitly join through a reverse index. |
 | customer listener table | Physical Delta table produced by the Tealium listener process. Configure through `source_event_table_name`. This replaces direct Event Hub reads for the customer flow. |
 | `tealium_eventhub_events_<run_id>` | SDP streaming table containing normalized source listener rows for a sizing run. |
-| `evaluated_realtime_memberships_<run_id>` | SDP streaming table with one evaluated row per event/profile/candidate segment. |
+| `evaluated_realtime_memberships_<run_id>` | SDP streaming table with one evaluated row per event/profile/candidate segment. Includes `source_commit_ts` when reading source CDF and `evaluation_emitted_at` when SDP emits the evaluation row. |
 | `membership_flags_current_<run_id>` | Auto CDC current-state table. This is the table intended to sync into Lakebase. |
 
 Lakebase/Postgres tables:
@@ -62,6 +62,43 @@ Lakebase/Postgres tables:
 | `cdp_rt.membership_flags_current_<run_id>` | Lakebase synced-table target for current realtime memberships, if configured as a Lakebase sync table. |
 | `cdp_rt.rt_batch_metrics` | Metrics emitted by the older direct-write notebook path. |
 | `cdp_rt.read_path_metrics` | Read-load metrics written by the serving read test. |
+
+## Latency Timestamps
+
+The realtime tables expose these timestamps:
+
+| Column / Metadata | Meaning |
+| --- | --- |
+| `source_event_ts_ms` | Business/event timestamp from the source event column, or source CDF commit timestamp when no event timestamp column is configured. |
+| `source_commit_ts` | Source Delta CDF `_commit_timestamp`, populated when `source_read_change_feed=true`; otherwise null unless the source table already has a `source_commit_ts` column. |
+| `evaluation_emitted_at` | Timestamp assigned by SDP when the evaluated profile/segment row is emitted into `evaluated_realtime_memberships`. |
+| `processed_at` | Legacy alias for the SDP evaluation timestamp, kept for compatibility. |
+| target CDF `_commit_timestamp` | Actual Delta commit time when Auto CDC writes/merges into `membership_flags_current`. This is not knowable inside the row before the commit; read it from the target table's change feed. |
+
+To measure source-Delta-landing to evaluation latency:
+
+```sql
+SELECT
+  percentile_approx(unix_millis(evaluation_emitted_at) - unix_millis(source_commit_ts), 0.5) AS p50_source_to_eval_ms,
+  percentile_approx(unix_millis(evaluation_emitted_at) - unix_millis(source_commit_ts), 0.95) AS p95_source_to_eval_ms
+FROM <catalog>.<schema>.<evaluated_realtime_memberships>
+WHERE source_commit_ts IS NOT NULL;
+```
+
+To measure the actual Auto CDC merge/commit time for the final current-membership table, query its Delta change feed:
+
+```sql
+SELECT
+  profile_id,
+  segment_id,
+  path,
+  source_event_id,
+  evaluation_emitted_at,
+  _commit_timestamp AS final_membership_commit_ts,
+  unix_millis(_commit_timestamp) - unix_millis(evaluation_emitted_at) AS eval_to_current_commit_ms
+FROM table_changes('<catalog>.<schema>.<membership_flags_current>', 0)
+WHERE _change_type IN ('insert', 'update_postimage');
+```
 
 ## Reverse Index
 

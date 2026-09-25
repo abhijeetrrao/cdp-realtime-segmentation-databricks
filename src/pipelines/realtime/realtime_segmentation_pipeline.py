@@ -433,6 +433,13 @@ def _ensure_event_contract(events):
     else:
         out = out.withColumn("event_ts", (F.unix_timestamp(F.current_timestamp()) * F.lit(1000)).cast("long"))
 
+    if "_commit_timestamp" in events.columns:
+        out = out.withColumn("source_commit_ts", F.col("_commit_timestamp").cast("timestamp"))
+    elif "source_commit_ts" in events.columns:
+        out = out.withColumn("source_commit_ts", F.col("source_commit_ts").cast("timestamp"))
+    else:
+        out = out.withColumn("source_commit_ts", F.lit(None).cast("timestamp"))
+
     if SOURCE_CHANGED_PROPERTIES_COL in events.columns:
         field = events.schema[SOURCE_CHANGED_PROPERTIES_COL]
         out = out.withColumn(
@@ -465,6 +472,7 @@ def _read_source_events():
         .load()
         .select(F.from_json(F.col("value").cast("string"), EVENT_SCHEMA).alias("e"))
         .select("e.*")
+        .transform(_ensure_event_contract)
     )
 
 
@@ -590,7 +598,9 @@ def evaluated_realtime_memberships():
         F.lit("realtime").alias("path"),
         F.col("e.event_id").alias("source_event_id"),
         F.col("e.event_ts").alias("source_event_ts_ms"),
+        F.col("e.source_commit_ts").alias("source_commit_ts"),
         F.to_timestamp(F.from_unixtime(F.col("e.event_ts") / F.lit(1000))).alias("qualified_at"),
+        F.current_timestamp().alias("evaluation_emitted_at"),
         F.current_timestamp().alias("processed_at"),
         _evaluate_mapped_rule_udf(
             F.col("r.rule_json"),
@@ -614,7 +624,9 @@ dp.create_streaming_table(
       path STRING,
       source_event_id STRING,
       source_event_ts_ms LONG,
+      source_commit_ts TIMESTAMP,
       qualified_at TIMESTAMP,
+      evaluation_emitted_at TIMESTAMP,
       processed_at TIMESTAMP,
       is_member BOOLEAN
     """,
